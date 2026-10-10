@@ -2,122 +2,479 @@ import SwiftUI
 import AppKit
 import UserNotifications
 
-struct RootView: View {
-    @EnvironmentObject var store: Store
-    @State private var pasted = ""
-    @State private var badPaste = false
-    @State private var showSettings = false
-
-    var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-
-            if store.token.isEmpty || showSettings {
-                SettingsView(showSettings: $showSettings)
-            } else {
-                pasteBar
-                Divider()
-                list
-                Divider()
-                footer
-            }
+extension View {
+    /// macOS 26 shades the edges of a scroll view; inside the popover's own boxes
+    /// that reads as a stray shadow, so turn it off where we draw the chrome.
+    @ViewBuilder
+    func noScrollEdgeShadow() -> some View {
+        if #available(macOS 26.0, *) {
+            self.scrollEdgeEffectHidden(true, for: .all)
+        } else {
+            self
         }
-        .frame(width: 420)
-        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// Appearance options from Settings.
+enum Theme {
+    static let accents: [(String, String, Color?)] = [
+        ("system", "System", nil),
+        ("blue", "Blue", .blue),
+        ("purple", "Purple", .purple),
+        ("pink", "Pink", .pink),
+        ("red", "Red", .red),
+        ("orange", "Orange", .orange),
+        ("green", "Green", .green),
+        ("teal", "Teal", .teal),
+        ("indigo", "Indigo", .indigo),
+    ]
+    static func accent(_ raw: String) -> Color {
+        accents.first { $0.0 == raw }?.2 ?? .accentColor
+    }
+}
+
+/// Rounded highlight behind a small control while the pointer is over it.
+struct HoverHighlight: ViewModifier {
+    var padding: CGFloat = 4
+    @State private var hovering = false
+    func body(content: Content) -> some View {
+        content
+            .padding(padding)
+            .frame(minWidth: 24, minHeight: 22)
+            .background(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.primary.opacity(hovering ? 0.12 : 0)))
+            .contentShape(Rectangle())
+            .onHover { hovering = $0 }
+            .animation(.easeOut(duration: 0.1), value: hovering)
+    }
+}
+
+extension View {
+    func hoverHighlight(padding: CGFloat = 4) -> some View { modifier(HoverHighlight(padding: padding)) }
+}
+
+/// Hands back the NSWindow hosting a SwiftUI view.
+struct WindowAccessor: NSViewRepresentable {
+    let onWindow: (NSWindow?) -> Void
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async { onWindow(v.window) }
+        return v
+    }
+    func updateNSView(_ v: NSView, context: Context) {
+        DispatchQueue.main.async { if let w = v.window { onWindow(w) } }
+    }
+}
+
+/// Behind-window blur for the glass theme.
+struct GlassBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = .hudWindow
+        v.blendingMode = .behindWindow
+        v.state = .active
+        return v
+    }
+    func updateNSView(_ v: NSVisualEffectView, context: Context) {}
+}
+
+/// Shared chrome for text inputs. The stock `.roundedBorder` style draws an AppKit
+/// bezel with a drop shadow that looks wrong inside a menu-bar popover.
+struct FieldBox<Content: View>: View {
+    var focused = false
+    var invalid = false
+    @ViewBuilder var content: Content
+
+    private var border: Color {
+        if invalid { return .red.opacity(0.8) }
+        return focused ? .accentColor.opacity(0.9) : .primary.opacity(0.14)
     }
 
-    private var header: some View {
-        HStack(spacing: 8) {
-            AccountChip()
-            if store.changesRequestedCount > 0 {
-                Pill("\(store.changesRequestedCount) needs work", .red)
+    var body: some View {
+        content
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(border, lineWidth: 1))
+    }
+}
+
+struct RootView: View {
+    @EnvironmentObject var store: Store
+    @AppStorage("section") private var sectionRaw = ListSection.inbox.rawValue
+    @AppStorage("compactRows") private var compactRows = false
+    @AppStorage("sidebarCollapsed") private var sidebarCollapsed = false
+    @AppStorage("theme") private var theme = "standard"
+    @AppStorage("accent") private var accent = "system"
+    @State private var appeared = false
+    @State private var window: NSWindow?
+
+    private var section: ListSection {
+        get { ListSection(rawValue: sectionRaw) ?? .inbox }
+        nonmutating set { sectionRaw = newValue.rawValue }
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Sidebar(selection: Binding(get: { section }, set: { section = $0 }),
+                    collapsed: sidebarCollapsed)
+                .frame(width: sidebarCollapsed ? 54 : 168)
+            Divider()
+            VStack(spacing: 0) {
+                if store.token.isEmpty || section == .settings {
+                    SectionHeader(title: "Settings", symbol: "gearshape")
+                    Divider()
+                    SettingsView(showSettings: Binding(
+                        get: { true }, set: { if !$0 { section = .inbox } }))
+                } else if section == .report {
+                    SectionHeader(title: "Work report", symbol: "doc.text")
+                    Divider()
+                    WorkReportView(isShown: Binding(
+                        get: { true }, set: { if !$0 { section = .inbox } }))
+                    Spacer(minLength: 0)
+                } else {
+                    listHeader
+                    Divider()
+                    PRList(section: section)
+                }
             }
-            if store.yourTurnCount > 0 {
-                Pill("\(store.yourTurnCount) to review", .yellow)
+            .frame(maxWidth: .infinity)
+        }
+        .frame(width: contentSize.width, height: contentSize.height)
+        .background {
+            if theme == "glass" {
+                ZStack {
+                    GlassBackground()
+                    Theme.accent(accent).opacity(0.06)
+                }
+            } else {
+                Color(nsColor: .windowBackgroundColor)
             }
+        }
+        .tint(Theme.accent(accent))
+        .environment(\.themeAccent, Theme.accent(accent))
+        .environment(\.glassTheme, theme == "glass")
+        // Opening animation: a quick spring in, replayed each time the popover opens.
+        .scaleEffect(appeared ? 1 : 0.94, anchor: .top)
+        .opacity(appeared ? 1 : 0)
+        .blur(radius: appeared ? 0 : 6)
+        .background(WindowAccessor { w in if window !== w { window = w } })
+        // Only the popover's own window showing/hiding drives the animation —
+        // menus and popovers opened from a row are other windows and must not
+        // blur this one out.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
+            guard let w = note.object as? NSWindow, w === window else { return }
+            if w.occlusionState.contains(.visible) { playOpen() } else { appeared = false }
+        }
+        .onAppear { playOpen() }
+        .onChange(of: sidebarCollapsed) { _, _ in resizeWindow() }
+        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: sidebarCollapsed)
+    }
+
+    private var contentSize: CGSize { CGSize(width: sidebarCollapsed ? 526 : 640, height: 560) }
+
+    /// MenuBarExtra windows don't shrink on their own when the content does,
+    /// leaving a dead, shadowed strip. Resize the window, keeping it centred
+    /// under the menu-bar icon and pinned at the top.
+    private func resizeWindow() {
+        guard let window else { return }
+        let old = window.frame
+        let size = window.frameRect(forContentRect: CGRect(origin: .zero, size: contentSize)).size
+        let frame = CGRect(x: old.midX - size.width / 2, y: old.maxY - size.height,
+                           width: size.width, height: size.height)
+        window.setFrame(frame, display: true, animate: true)
+        window.invalidateShadow()
+    }
+
+    private func playOpen() {
+        guard !appeared else { return }
+        withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) { appeared = true }
+    }
+
+    private var listHeader: some View {
+        HStack(spacing: 10) {
+            IconButton("sidebar.left", help: sidebarCollapsed ? "Show sidebar" : "Collapse sidebar") {
+                sidebarCollapsed.toggle()
+            }
+            .padding(.leading, 10)
+            SectionHeader(title: section.title, symbol: section.symbol,
+                          subtitle: store.lastRefresh.map { "Updated \($0.formatted(date: .omitted, time: .shortened))" }
+                              ?? "Not synced yet")
             Spacer()
             if store.isRefreshing {
                 ProgressView().controlSize(.small)
             } else {
-                Button { Task { await store.refresh() } } label: {
-                    Image(systemName: "arrow.clockwise")
-                }.buttonStyle(.borderless).help("Refresh now")
+                IconButton("arrow.clockwise", help: "Refresh now") { Task { await store.refresh() } }
             }
-            Button { showSettings.toggle() } label: { Image(systemName: "gearshape") }
-                .buttonStyle(.borderless)
+            IconButton(compactRows ? "list.bullet.below.rectangle" : "list.bullet",
+                       help: compactRows ? "Expanded rows" : "Compact rows") { compactRows.toggle() }
         }
-        .padding(10)
+        .padding(.trailing, 12)
+    }
+}
+
+private struct ThemeAccentKey: EnvironmentKey { static let defaultValue: Color = .accentColor }
+private struct GlassThemeKey: EnvironmentKey { static let defaultValue = false }
+extension EnvironmentValues {
+    var themeAccent: Color {
+        get { self[ThemeAccentKey.self] } set { self[ThemeAccentKey.self] = newValue }
+    }
+    var glassTheme: Bool {
+        get { self[GlassThemeKey.self] } set { self[GlassThemeKey.self] = newValue }
+    }
+}
+
+/// Title row at the top of the content pane.
+struct SectionHeader: View {
+    let title: String
+    let symbol: String
+    var subtitle: String? = nil
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: symbol)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(title).font(.system(size: 15, weight: .semibold))
+                if let subtitle {
+                    Text(subtitle).font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 50)
+    }
+}
+
+/// Borderless toolbar icon with a hover highlight.
+struct IconButton: View {
+    let symbol: String
+    let help: String
+    let action: () -> Void
+    @State private var hovering = false
+    init(_ symbol: String, help: String, action: @escaping () -> Void) {
+        self.symbol = symbol; self.help = help; self.action = action
+    }
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 26, height: 24)
+                .background(RoundedRectangle(cornerRadius: 6)
+                    .fill(hovering ? Color.primary.opacity(0.08) : .clear))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .onHover { hovering = $0 }
+        .help(help)
+    }
+}
+
+/// Source-list style sidebar: account, sections with counts, utilities.
+/// Collapses to an icon rail; hover an icon for its name.
+struct Sidebar: View {
+    @EnvironmentObject var store: Store
+    @Environment(\.themeAccent) private var accent
+    @Environment(\.glassTheme) private var glass
+    @Binding var selection: ListSection
+    var collapsed: Bool
+    @State private var pasted = ""
+    @State private var badPaste = false
+    @State private var showPaste = false
+    @FocusState private var pasteFocused: Bool
+
+    var body: some View {
+        VStack(alignment: collapsed ? .center : .leading, spacing: 2) {
+            AccountChip(compact: collapsed)
+                .padding(.horizontal, collapsed ? 0 : 10)
+                .padding(.top, 12)
+                .padding(.bottom, 10)
+
+            if collapsed {
+                railButton("plus", help: "Watch a PR link", active: false) { showPaste.toggle() }
+                    .popover(isPresented: $showPaste, arrowEdge: .trailing) {
+                        pasteField.frame(width: 260).padding(10)
+                    }
+                    .padding(.bottom, 6)
+            } else {
+                pasteField
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 8)
+                sectionLabel("Pull requests")
+            }
+
+            ForEach(ListSection.lists) { s in
+                let count = store.prs(in: s).count
+                if count > 0 || [.inbox, .needsYou].contains(s) || selection == s {
+                    item(s, count: count)
+                }
+            }
+
+            Spacer(minLength: 0)
+
+            if !collapsed { sectionLabel("GitWall") }
+            item(.report, count: nil)
+            item(.settings, count: nil)
+            if collapsed {
+                railButton("power", help: "Quit GitWall", active: false) { NSApplication.shared.terminate(nil) }
+                    .padding(.bottom, 10)
+            } else {
+                Button { NSApplication.shared.terminate(nil) } label: {
+                    Label("Quit", systemImage: "power")
+                        .font(.system(size: 12))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8).padding(.vertical, 5)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.bottom, 10)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(Color.primary.opacity(glass ? 0.02 : 0.035))
     }
 
-    private var pasteBar: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "link").foregroundStyle(.secondary)
-            TextField("Paste a PR link to watch it", text: $pasted)
-                .textFieldStyle(.plain)
-                .onSubmit(add)
-            if !pasted.isEmpty {
-                Button("Watch", action: add).controlSize(.small)
+    private var pasteField: some View {
+        FieldBox(focused: pasteFocused, invalid: badPaste) {
+            HStack(spacing: 5) {
+                Image(systemName: "plus").font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                TextField("Watch PR link", text: $pasted)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11))
+                    .focused($pasteFocused)
+                    .onSubmit(add)
+                    .onChange(of: pasted) { _, _ in badPaste = false }
             }
         }
-        .padding(.horizontal, 10).padding(.vertical, 7)
-        .background(badPaste ? Color.red.opacity(0.15) : Color.clear)
+    }
+
+    private func sectionLabel(_ text: String) -> some View {
+        Text(text.uppercased())
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(.tertiary)
+            .padding(.horizontal, 16)
+            .padding(.top, 6).padding(.bottom, 2)
+    }
+
+    private func railButton(_ symbol: String, help: String, active: Bool,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 13))
+                .frame(width: 34, height: 30)
+                .background(RoundedRectangle(cornerRadius: 7).fill(active ? accent : .clear))
+                .foregroundStyle(active ? Color.white : .secondary)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    @ViewBuilder
+    private func item(_ s: ListSection, count: Int?) -> some View {
+        let selected = selection == s
+        let urgent = s == .needsYou && (count ?? 0) > 0
+        if collapsed {
+            railButton(s.symbol, help: s.title + (count.map { $0 > 0 ? " (\($0))" : "" } ?? ""),
+                       active: selected) { selection = s }
+                .overlay(alignment: .topTrailing) {
+                    if let count, count > 0 {
+                        Text("\(count)")
+                            .font(.system(size: 8, weight: .bold).monospacedDigit())
+                            .padding(.horizontal, 3).padding(.vertical, 0.5)
+                            .background(Capsule().fill(urgent ? Color.red : Color.secondary.opacity(0.8)))
+                            .foregroundStyle(.white)
+                            .offset(x: 2, y: -2)
+                    }
+                }
+        } else {
+            Button { selection = s } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: s.symbol)
+                        .font(.system(size: 12))
+                        .frame(width: 16)
+                        .foregroundStyle(selected ? Color.white : urgent ? .red : .secondary)
+                    Text(s.title).font(.system(size: 12, weight: selected ? .semibold : .regular))
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    if let count, count > 0 {
+                        Text("\(count)")
+                            .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                            .padding(.horizontal, 6).padding(.vertical, 1)
+                            .background(Capsule().fill(selected ? Color.white.opacity(0.25)
+                                                       : urgent ? Color.red.opacity(0.18) : Color.primary.opacity(0.08)))
+                            .foregroundStyle(selected ? Color.white : urgent ? .red : .secondary)
+                    }
+                }
+                .foregroundStyle(selected ? Color.white : .primary)
+                .padding(.horizontal, 8).padding(.vertical, 5)
+                .background(RoundedRectangle(cornerRadius: 6).fill(selected ? accent : .clear))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 6)
+        }
     }
 
     private func add() {
         badPaste = !store.addWatched(pasted)
-        if !badPaste { pasted = "" }
+        if !badPaste { pasted = ""; showPaste = false; selection = .watching }
     }
+}
 
-    private var list: some View {
-        // A LazyVStack has no intrinsic height, so inside a MenuBarExtra window
-        // the scroll view collapses to nothing and the rows never appear.
-        // Plain VStack + an explicit height range keeps the list visible.
+/// The PRs of one section, grouped by repository.
+struct PRList: View {
+    @EnvironmentObject var store: Store
+    let section: ListSection
+
+    var body: some View {
+        // A LazyVStack has no intrinsic height inside a MenuBarExtra window, so
+        // use a plain VStack.
         ScrollView {
-            VStack(spacing: 0) {
+            VStack(spacing: 6) {
                 if let err = store.errorText {
-                    Text(err)
+                    Label(err, systemImage: "exclamationmark.triangle.fill")
                         .font(.callout)
                         .foregroundStyle(.red)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(10)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.red.opacity(0.08)))
                 }
-                if store.prs.isEmpty && store.errorText == nil {
-                    Text(store.isRefreshing ? "Loading…" : "Nothing to watch right now.")
-                        .foregroundStyle(.secondary)
-                        .padding(24)
+                let groups = store.groups(for: section)
+                if groups.isEmpty && store.errorText == nil {
+                    VStack(spacing: 8) {
+                        Image(systemName: store.isRefreshing ? "hourglass" : "checkmark.circle")
+                            .font(.system(size: 28, weight: .light))
+                            .foregroundStyle(.tertiary)
+                        Text(store.isRefreshing ? "Loading…" : "Nothing here")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 120)
                 }
-                ForEach(store.repoGroups) { group in
-                    RepoHeader(group: group)
-                    if !store.isCollapsed(group.slug) {
-                        ForEach(group.prs) { pr in
-                            PRRow(pr: pr)
-                            Divider()
+                if section == .inbox && !store.pinnedPRs.isEmpty {
+                    PinnedSection()
+                }
+                ForEach(section == .inbox ? store.repoGroups : groups) { group in
+                    VStack(spacing: 4) {
+                        RepoHeader(group: group)
+                        if !store.isCollapsed(group.slug) {
+                            ForEach(group.prs) { pr in
+                                PRRow(pr: pr).opacity(pr.isIgnored && section != .ignored ? 0.55 : 1)
+                            }
                         }
                     }
                 }
-                if !store.ignoredPRs.isEmpty {
-                    IgnoredSection()
-                }
             }
+            .padding(10)
         }
-        .frame(minHeight: 140, idealHeight: 460, maxHeight: 520)
-    }
-
-    private var footer: some View {
-        HStack {
-            if let t = store.lastRefresh {
-                Text("Updated \(t.formatted(date: .omitted, time: .shortened))")
-            } else {
-                Text("Not synced yet")
-            }
-            Spacer()
-            Button("Quit") { NSApplication.shared.terminate(nil) }
-                .buttonStyle(.borderless)
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 10).padding(.vertical, 6)
+        .noScrollEdgeShadow()
     }
 }
 
@@ -125,6 +482,13 @@ struct PRRow: View {
     @EnvironmentObject var store: Store
     let pr: PullRequest
     @State private var hovering = false
+    @State private var confirmResolve = false
+    @State private var showComments = false
+    @AppStorage("compactRows") private var compactSetting = false
+    @Environment(\.glassTheme) private var glass
+    /// Opened just this one row while the list is compact.
+    @State private var expandedHere = false
+    private var compact: Bool { compactSetting && !expandedHere }
 
     private var tint: Color {
         if pr.isMerged { return .purple }
@@ -145,21 +509,44 @@ struct PRRow: View {
                             : pr.isOngoing ? "hammer.fill" : pr.verdict.symbol)
                 .foregroundStyle(tint)
                 .frame(width: 16)
-                .padding(.top, 2)
+                .padding(.top, compact ? 0 : 2)
 
+            if compact {
+                // Minimal: lifecycle icon, number, title, review status.
+                HStack(spacing: 5) {
+                    Image(systemName: pr.state.symbol)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(StateBadge.color(pr.state))
+                        .help(pr.state.label)
+                    Text("#\(pr.number)").foregroundStyle(.secondary)
+                    Text(pr.title.isEmpty ? pr.slug : pr.title)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .font(.system(size: 12, weight: .medium))
+                .help("\(pr.title)\n\(pr.state.label) · \(pr.verdict.label)")
+            } else {
             VStack(alignment: .leading, spacing: 3) {
                 Text(pr.title.isEmpty ? pr.slug : pr.title)
                     .lineLimit(2)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 13, weight: .semibold))
 
                 HStack(spacing: 5) {
                     // The repo lives in the section header, so only the number here.
+                    StateBadge(state: pr.state)
                     Text("#\(pr.number)").foregroundStyle(.secondary)
-                    if pr.isDraft { Tag("Draft", .secondary) }
+                    if pr.isPinned { Tag("pinned", .orange) }
                     if pr.isOngoing { Tag("working on it", .teal) }
-                    if pr.myReviewRequested { Tag("your turn", .yellow) }
+                    if let mine = pr.myReview(login: store.account?.login) {
+                        Tag(mine.label + (pr.myReviewRequested && !pr.myTeamRequests.isEmpty
+                                ? " via \(pr.myTeamRequests.joined(separator: ", "))" : ""),
+                            myReviewColor(mine), symbol: mine.symbol)
+                    }
                     if pr.isIgnored { Tag("ignored", .secondary) }
-                    ForEach(Array(pr.sources).sorted(by: { $0.rawValue < $1.rawValue }), id: \.self) { s in
+                    if pr.isMenuBarMuted { Tag("not in menu bar", .secondary, symbol: "menubar.rectangle") }
+                    // Review sources are covered by the your-review tag above.
+                    ForEach(Array(pr.sources.subtracting([.reviewRequest, .reviewed]))
+                                .sorted(by: { $0.rawValue < $1.rawValue }), id: \.self) { s in
                         Tag(sourceLabel(s), .secondary)
                     }
                 }
@@ -180,38 +567,111 @@ struct PRRow: View {
                 }
                 .font(.system(size: 11, weight: .medium))
 
-                if !pr.reReviewRequested.isEmpty {
-                    Label("Re-review requested from \(pr.reReviewRequested.joined(separator: ", "))",
-                          systemImage: "arrow.triangle.2.circlepath")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                } else if !pr.awaitingReview.isEmpty {
-                    Text("Waiting on \(pr.awaitingReview.joined(separator: ", "))")
+                if !pr.reviewers.isEmpty {
+                    ReviewerStrip(reviewers: pr.reviewers.filter { !$0.isBot },
+                                  me: store.account?.login)
+                }
+
+                ForEach(pr.botFindings) { f in
+                    HStack(spacing: 3) {
+                        Image(systemName: "sparkles").foregroundStyle(.secondary)
+                        Text(f.displayName).foregroundStyle(.secondary)
+                        if f.counts.isEmpty {
+                            Tag("no findings", .green)
+                        }
+                        ForEach(f.counts, id: \.severity) { c in
+                            Tag("\(c.severity) · \(c.n)", severityColor(c.severity))
+                        }
+                    }
+                    .font(.system(size: 10))
+                }
+
+                if !pr.botReviews.isEmpty {
+                    Label(pr.botReviews.map { "\($0.login): \($0.verdict.label)" }.joined(separator: ", "),
+                          systemImage: "sparkles")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 }
             }
 
+            }
+
             Spacer(minLength: 0)
 
-            if hovering {
-                HStack(spacing: 4) {
-                    Button { store.setOngoing(pr, !pr.isOngoing) } label: {
-                        Image(systemName: pr.isOngoing ? "arrow.uturn.backward" : "hammer")
-                    }
-                    .help(pr.isOngoing
-                          ? "Back to needing attention"
-                          : "I'm working on these changes — stop counting it")
+            if compactSetting {
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { expandedHere.toggle() }
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .rotationEffect(.degrees(expandedHere ? 180 : 0))
+                        .frame(width: 20, height: 18)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .hoverHighlight()
+                .help(expandedHere ? "Collapse" : "Show details")
+            }
 
-                    Button { store.setIgnored(pr, !pr.isIgnored) } label: {
-                        Image(systemName: pr.isIgnored ? "bell" : "bell.slash")
+            if pr.unresolvedThreads > 0 {
+                Button { showComments.toggle() } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "bubble.left.and.text.bubble.right")
+                        Text("\(pr.unresolvedThreads)").monospacedDigit()
                     }
-                    .help(pr.isIgnored ? "Stop ignoring" : "Ignore this PR")
+                    .font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .background(Capsule().fill(Color.orange.opacity(0.15)))
+                    .foregroundStyle(.orange)
+                }
+                .buttonStyle(.plain)
+                .hoverHighlight(padding: 0)
+                .help("\(pr.unresolvedThreads) unresolved comment threads")
+                .popover(isPresented: $showComments, arrowEdge: .trailing) {
+                    UnresolvedComments(pr: pr) {
+                        showComments = false
+                        confirmResolve = true
+                    }
+                }
+            }
+
+            if hovering {
+                HStack(spacing: 2) {
+                    Menu {
+                        Button("Copy link") { Store.copyToPasteboard(pr.url) }
+                        promptButtons
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .hoverHighlight()
+                    .help("Copy the link or a saved prompt")
+
+                    Button { store.setPinned(pr, !pr.isPinned) } label: {
+                        Image(systemName: pr.isPinned ? "pin.slash" : "pin")
+                    }
+                    .hoverHighlight()
+                    .help(pr.isPinned ? "Unpin" : "Pin to the top")
+
+                    Menu {
+                        ignoreButtons
+                    } label: {
+                        Image(systemName: pr.isIgnored || pr.isMenuBarMuted ? "bell" : "bell.slash")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .hoverHighlight()
+                    .help("Ignore options")
 
                     if pr.sources.contains(.watched) {
                         Button {
                             store.removeWatched(PRRef(owner: pr.owner, repo: pr.repo, number: pr.number))
                         } label: { Image(systemName: "xmark.circle") }
+                            .hoverHighlight()
                             .help("Stop watching")
                     }
                 }
@@ -220,33 +680,113 @@ struct PRRow: View {
                 .font(.system(size: 12))
             }
         }
-        .padding(.horizontal, 10).padding(.vertical, 8)
-        .background(hovering ? Color.primary.opacity(0.06) : .clear)
+        .padding(.leading, 12).padding(.trailing, 10).padding(.vertical, compact ? 6 : 10)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(glass ? AnyShapeStyle(Color.primary.opacity(hovering ? 0.09 : 0.05))
+                            : AnyShapeStyle(Color(nsColor: .controlBackgroundColor).opacity(hovering ? 1 : 0.7)))
+                .shadow(color: .black.opacity(hovering ? 0.08 : 0.03), radius: hovering ? 4 : 1, y: 1)
+        )
+        .overlay(alignment: .leading) {
+            // Status accent stripe.
+            RoundedRectangle(cornerRadius: 2).fill(tint.opacity(0.85))
+                .frame(width: 3).padding(.vertical, 8)
+        }
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
+            .strokeBorder(Color.primary.opacity(hovering ? 0.12 : 0.06)))
         .contentShape(Rectangle())
+        .animation(.easeOut(duration: 0.12), value: hovering)
         .onHover { hovering = $0 }
         .onTapGesture {
             if let u = URL(string: pr.url) { NSWorkspace.shared.open(u) }
+        }
+        .alert("Resolve \(pr.unresolvedThreads) comment threads on #\(pr.number)?",
+               isPresented: $confirmResolve) {
+            Button("Resolve all") { Task { await store.resolveAllComments(pr) } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Marks every unresolved review thread as resolved on GitHub.")
         }
         .contextMenu {
             Button("Open on GitHub") {
                 if let u = URL(string: pr.url) { NSWorkspace.shared.open(u) }
             }
-            Button("Copy link") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(pr.url, forType: .string)
+            Button("Copy link") { Store.copyToPasteboard(pr.url) }
+            if !store.copyPrompts.isEmpty {
+                Menu("Copy prompt") { promptButtons }
             }
             Divider()
             Button(pr.isOngoing ? "Needs attention again" : "Mark as working on it") {
                 store.setOngoing(pr, !pr.isOngoing)
             }
-            Button(pr.isIgnored ? "Stop ignoring" : "Ignore this PR") {
-                store.setIgnored(pr, !pr.isIgnored)
+            Button(pr.isPinned ? "Unpin" : "Pin to the top") {
+                store.setPinned(pr, !pr.isPinned)
             }
+            if pr.unresolvedThreads > 0 {
+                Button("Resolve all comments (\(pr.unresolvedThreads))") { confirmResolve = true }
+            }
+            ignoreButtons
             if pr.sources.contains(.watched) {
                 Button("Stop watching") {
                     store.removeWatched(PRRef(owner: pr.owner, repo: pr.repo, number: pr.number))
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var ignoreButtons: some View {
+        Button(pr.isIgnored ? "Stop ignoring" : "Ignore PR completely") {
+            store.setIgnored(pr, !pr.isIgnored)
+        }
+        Button(pr.isMenuBarMuted ? "Count in menu bar again" : "Ignore in menu bar") {
+            store.setMenuBarMuted(pr, !pr.isMenuBarMuted)
+        }
+    }
+
+    private func myReviewColor(_ m: MyReview) -> Color {
+        switch m {
+        case .yourTurn, .reRequested: return .yellow
+        case .changesRequested: return .red
+        case .approved: return .green
+        case .commented: return .blue
+        }
+    }
+
+    /// Prompts that fit this PR's situation first, the rest under "Other prompts".
+    @ViewBuilder
+    private var promptButtons: some View {
+        let suggested = store.copyPrompts.filter { $0.when != .always && $0.when.matches(pr) }
+        let rest = store.copyPrompts.filter { !suggested.contains($0) }
+        if !suggested.isEmpty {
+            Divider()
+            ForEach(suggested) { prompt in promptButton(prompt) }
+        }
+        if !rest.isEmpty {
+            Divider()
+            if suggested.isEmpty {
+                ForEach(rest) { prompt in promptButton(prompt) }
+            } else {
+                Menu("Other prompts") {
+                    ForEach(rest) { prompt in promptButton(prompt) }
+                }
+            }
+        }
+    }
+
+    private func promptButton(_ prompt: CopyPrompt) -> some View {
+        Button(prompt.name.isEmpty ? "Untitled prompt" : prompt.name) {
+            Store.copyToPasteboard(prompt.render(for: pr))
+        }
+    }
+
+    private func severityColor(_ s: String) -> Color {
+        switch s.uppercased() {
+        case "P0": return .red
+        case "P1": return .orange
+        case "P2": return .yellow
+        case "P3": return .blue
+        default: return .secondary
         }
     }
 
@@ -256,16 +796,231 @@ struct PRRow: View {
         case .reviewRequest: return "your review"
         case .authored: return "yours"
         case .watched: return "watching"
+        case .reviewed: return "reviewed"
         }
+    }
+}
+
+/// GitHub-style lifecycle badge: open, draft, conflicts, merged, closed.
+struct StateBadge: View {
+    let state: PRState
+
+    private var color: Color { Self.color(state) }
+
+    static func color(_ state: PRState) -> Color {
+        switch state {
+        case .open: return .green
+        case .draft: return .secondary
+        case .conflict: return .orange
+        case .merged: return .purple
+        case .closed: return .red
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: state.symbol).font(.system(size: 9, weight: .semibold))
+            Text(state.label)
+        }
+        .padding(.horizontal, 5).padding(.vertical, 1)
+        .background(color.opacity(0.15), in: Capsule())
+        .foregroundStyle(color)
+        .help(state == .conflict ? "This branch has conflicts with the base branch" : state.label)
+    }
+}
+
+/// Every reviewer with their current verdict, so you can see where the PR
+/// stands even after your own review is in.
+struct ReviewerStrip: View {
+    let reviewers: [Reviewer]
+    let me: String?
+
+    var body: some View {
+        if !reviewers.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(summary)
+                    .foregroundStyle(.secondary)
+                FlowRow(reviewers) { r in chip(r) }
+            }
+            .font(.system(size: 10))
+        }
+    }
+
+    private var summary: String {
+        let count = { (v: ReviewVerdict) in reviewers.filter { $0.verdict == v }.count }
+        var parts: [String] = []
+        if count(.approved) > 0 { parts.append("\(count(.approved)) approved") }
+        if count(.changesRequested) > 0 { parts.append("\(count(.changesRequested)) changes requested") }
+        if count(.commented) > 0 { parts.append("\(count(.commented)) commented") }
+        if count(.pending) > 0 { parts.append("\(count(.pending)) pending") }
+        let noun = reviewers.count == 1 ? "reviewer" : "reviewers"
+        return "\(reviewers.count) \(noun) · " + parts.joined(separator: ", ")
+    }
+
+    private func chip(_ r: Reviewer) -> some View {
+        let isMe = me.map { r.login.caseInsensitiveCompare($0) == .orderedSame } ?? false
+        let color: Color = switch r.verdict {
+        case .approved: .green
+        case .changesRequested: .red
+        case .commented: .blue
+        case .pending, .none: .yellow
+        }
+        let symbol = r.reRequested ? "arrow.triangle.2.circlepath"
+            : r.isTeam ? "person.2.fill" : r.verdict.symbol
+        return HStack(spacing: 2) {
+            Image(systemName: symbol).font(.system(size: 8))
+            Text(isMe ? "you" : r.login).fontWeight(isMe ? .bold : .regular)
+        }
+        .padding(.horizontal, 4).padding(.vertical, 1)
+        .background(color.opacity(0.13), in: Capsule())
+        .foregroundStyle(color)
+        .help("\(r.login): \(r.verdict.label)\(r.reRequested ? " — re-review requested" : "")")
+    }
+}
+
+/// Minimal wrapping row for chips.
+struct FlowRow<Item: Identifiable, Content: View>: View {
+    let items: [Item]
+    let content: (Item) -> Content
+    init(_ items: [Item], @ViewBuilder content: @escaping (Item) -> Content) {
+        self.items = items; self.content = content
+    }
+    var body: some View {
+        FlowLayout(spacing: 3) {
+            ForEach(items) { content($0) }
+        }
+    }
+}
+
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 4
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let rows = arrange(width: proposal.width ?? .infinity, subviews: subviews)
+        let height = rows.map(\.height).reduce(0, +) + spacing * CGFloat(max(0, rows.count - 1))
+        let width = rows.map(\.width).max() ?? 0
+        return CGSize(width: proposal.width ?? width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var y = bounds.minY
+        for row in arrange(width: bounds.width, subviews: subviews) {
+            var x = bounds.minX
+            for i in row.indices {
+                let size = subviews[i].sizeThatFits(.unspecified)
+                subviews[i].place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+                x += size.width + spacing
+            }
+            y += row.height + spacing
+        }
+    }
+
+    private struct Row { var indices: [Int] = []; var width: CGFloat = 0; var height: CGFloat = 0 }
+
+    private func arrange(width: CGFloat, subviews: Subviews) -> [Row] {
+        var rows: [Row] = [Row()]
+        for i in subviews.indices {
+            let size = subviews[i].sizeThatFits(.unspecified)
+            if !rows[rows.count - 1].indices.isEmpty && rows[rows.count - 1].width + spacing + size.width > width {
+                rows.append(Row())
+            }
+            var row = rows[rows.count - 1]
+            row.width += (row.indices.isEmpty ? 0 : spacing) + size.width
+            row.height = max(row.height, size.height)
+            row.indices.append(i)
+            rows[rows.count - 1] = row
+        }
+        return rows.filter { !$0.indices.isEmpty }
+    }
+}
+
+/// Popover listing a PR's unresolved review threads; each opens on GitHub.
+struct UnresolvedComments: View {
+    let pr: PullRequest
+    let resolveAll: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Unresolved comments").font(.headline)
+                Spacer()
+                Text("\(pr.unresolvedThreads)").foregroundStyle(.secondary)
+            }
+            .padding(12)
+            Divider()
+            ScrollView {
+                VStack(spacing: 6) {
+                    ForEach(pr.unresolved) { t in ThreadRow(thread: t) }
+                }
+                .padding(8)
+            }
+            .noScrollEdgeShadow()
+            .frame(maxHeight: 340)
+            Divider()
+            HStack {
+                Button("Open PR") {
+                    if let u = URL(string: pr.url + "/files") { NSWorkspace.shared.open(u) }
+                }
+                Spacer()
+                Button("Resolve all", action: resolveAll)
+                    .buttonStyle(.borderedProminent)
+            }
+            .controlSize(.small)
+            .padding(10)
+        }
+        .frame(width: 360)
+    }
+}
+
+struct ThreadRow: View {
+    let thread: ReviewThread
+    @State private var hovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 4) {
+                Image(systemName: "person.crop.circle").foregroundStyle(.secondary)
+                Text(thread.author).fontWeight(.semibold)
+                Spacer()
+                if let path = thread.path {
+                    Text(URL(fileURLWithPath: path).lastPathComponent + (thread.line.map { ":\($0)" } ?? ""))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .help(path)
+                }
+            }
+            .font(.system(size: 11))
+            Text(thread.body.isEmpty ? "(no text)" : thread.body)
+                .font(.system(size: 11))
+                .lineLimit(3)
+                .foregroundStyle(.primary.opacity(0.85))
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 7)
+            .fill(hovering ? Color.primary.opacity(0.09) : Color.primary.opacity(0.04)))
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .onTapGesture {
+            if let u = URL(string: thread.url) { NSWorkspace.shared.open(u) }
+        }
+        .help("Open this comment on GitHub")
     }
 }
 
 struct Tag: View {
     let text: String
     let color: Color
-    init(_ text: String, _ color: Color) { self.text = text; self.color = color }
+    var symbol: String? = nil
+    init(_ text: String, _ color: Color, symbol: String? = nil) {
+        self.text = text; self.color = color; self.symbol = symbol
+    }
     var body: some View {
-        Text(text)
+        HStack(spacing: 2) {
+            if let symbol { Image(systemName: symbol).font(.system(size: 8)) }
+            Text(text)
+        }
             .padding(.horizontal, 5).padding(.vertical, 1)
             .background(color.opacity(0.15), in: Capsule())
             .foregroundStyle(color)
@@ -277,14 +1032,21 @@ struct SettingsView: View {
     @Binding var showSettings: Bool
     @State private var draft = ""
     @State private var ghToken: String?
+    @AppStorage("compactRows") private var compactRows = false
+    @AppStorage("theme") private var theme = "standard"
+    @AppStorage("accent") private var accent = "system"
 
     var body: some View {
+        // Settings outgrew the popover; same explicit height range as the PR list.
+        ScrollView {
         VStack(alignment: .leading, spacing: 12) {
             Text("GitHub token").font(.headline)
             Text("Needs the `repo` scope. Stored in your login keychain. If `gh` is installed and logged in, GitWall picks its token up automatically.")
                 .font(.caption).foregroundStyle(.secondary)
-            SecureField("ghp_… / github_pat_…", text: $draft)
-                .textFieldStyle(.roundedBorder)
+            FieldBox {
+                SecureField("ghp_… / github_pat_…", text: $draft)
+                    .textFieldStyle(.plain)
+            }
             HStack {
                 Button("Save") {
                     store.updateToken(draft)
@@ -313,10 +1075,44 @@ struct SettingsView: View {
 
             Divider()
 
+            promptsSection
+
+            Divider()
+
             Stepper("Check every \(store.pollSeconds)s",
                     value: $store.pollSeconds, in: 30...1800, step: 30)
             Toggle("Notify when CI starts failing", isOn: $store.notifyCI)
             Toggle("Include PRs I authored", isOn: $store.includeAuthored)
+            Picker("Theme", selection: $theme) {
+                Text("Standard").tag("standard")
+                Text("Liquid glass").tag("glass")
+            }
+            .pickerStyle(.segmented)
+            HStack(spacing: 8) {
+                Text("Accent")
+                ForEach(Theme.accents, id: \.0) { key, name, color in
+                    Button { accent = key } label: {
+                        Circle()
+                            .fill(color.map { AnyShapeStyle($0) }
+                                  ?? AnyShapeStyle(LinearGradient(colors: [.blue, .purple, .pink],
+                                                                  startPoint: .topLeading, endPoint: .bottomTrailing)))
+                            .frame(width: 16, height: 16)
+                            .overlay(Circle().strokeBorder(Color.primary.opacity(accent == key ? 0.9 : 0), lineWidth: 2)
+                                .padding(-3))
+                    }
+                    .buttonStyle(.plain)
+                    .help(name)
+                }
+            }
+            Picker("View", selection: $compactRows) {
+                Text("Expanded").tag(false)
+                Text("Compact").tag(true)
+            }
+            .pickerStyle(.segmented)
+            Stepper(store.finishedRetentionMinutes == 0
+                        ? "Remove merged/closed PRs right away"
+                        : "Keep merged/closed PRs for \(store.finishedRetentionMinutes) min",
+                    value: $store.finishedRetentionMinutes, in: 0...1440, step: 5)
 
             HStack {
                 Spacer()
@@ -327,6 +1123,9 @@ struct SettingsView: View {
             }
         }
         .padding(14)
+        }
+        .noScrollEdgeShadow()
+        .frame(minHeight: 260, idealHeight: 520, maxHeight: 520)
         .task { ghToken = TokenStore.fromGHCLI() }
         .task { await store.refreshNotificationStatus() }
         .onChange(of: store.pollSeconds) { _, _ in Task { await store.start() } }
@@ -360,6 +1159,60 @@ struct SettingsView: View {
         }
     }
 
+    private var promptsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Copy prompts").font(.headline)
+                Spacer()
+                Button {
+                    store.copyPrompts.append(CopyPrompt(name: "New prompt", template: "{{pr-link}}"))
+                } label: { Label("Add", systemImage: "plus") }
+                    .buttonStyle(.borderless)
+            }
+            Text(verbatim: "Offered by the copy button on each PR. Placeholders: \(CopyPrompt.placeholderHelp)")
+                .font(.caption).foregroundStyle(.secondary)
+            ForEach(store.copyPrompts) { prompt in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        FieldBox {
+                            TextField("Name", text: promptBinding(prompt.id).name)
+                                .textFieldStyle(.plain)
+                        }
+                        Button {
+                            store.copyPrompts.removeAll { $0.id == prompt.id }
+                        } label: { Image(systemName: "trash") }
+                            .buttonStyle(.borderless)
+                            .help("Delete this prompt")
+                    }
+                    Picker("Suggested on", selection: promptBinding(prompt.id).when) {
+                        ForEach(PromptContext.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
+                    .labelsHidden()
+                    .controlSize(.small)
+                    FieldBox {
+                        TextEditor(text: promptBinding(prompt.id).template)
+                            .font(.system(size: 11, design: .monospaced))
+                            .scrollContentBackground(.hidden)
+                            .noScrollEdgeShadow()
+                            .frame(minHeight: 64, maxHeight: 120)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Looks the prompt up by id on every access, so deleting one mid-edit can't index out of range.
+    private func promptBinding(_ id: UUID) -> Binding<CopyPrompt> {
+        Binding(
+            get: { store.copyPrompts.first { $0.id == id } ?? CopyPrompt(name: "", template: "") },
+            set: { updated in
+                if let i = store.copyPrompts.firstIndex(where: { $0.id == id }) {
+                    store.copyPrompts[i] = updated
+                }
+            }
+        )
+    }
+
     private var notificationStatusBadge: some View {
         let (label, color): (String, Color) = switch store.notificationStatus {
         case .authorized, .provisional: ("On", .green)
@@ -376,6 +1229,8 @@ struct SettingsView: View {
 /// Who GitWall is signed in as. Click to open the GitHub profile.
 struct AccountChip: View {
     @EnvironmentObject var store: Store
+    /// Avatar only, for the collapsed sidebar.
+    var compact = false
 
     var body: some View {
         HStack(spacing: 6) {
@@ -392,6 +1247,7 @@ struct AccountChip: View {
                     .frame(width: 20, height: 20)
             }
 
+            if !compact {
             VStack(alignment: .leading, spacing: 0) {
                 Text(store.account?.displayName ?? "GitWall")
                     .font(.system(size: 12, weight: .semibold))
@@ -400,6 +1256,7 @@ struct AccountChip: View {
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 }
+            }
             }
         }
         .contentShape(Rectangle())
@@ -448,12 +1305,38 @@ struct RepoHeader: View {
                 .foregroundStyle(.secondary)
         }
         .font(.system(size: 11, weight: .semibold))
-        .padding(.horizontal, 10).padding(.vertical, 5)
+        .padding(.horizontal, 6).padding(.top, 6).padding(.bottom, 2)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(hovering ? Color.primary.opacity(0.08) : Color.primary.opacity(0.035))
+        .background(RoundedRectangle(cornerRadius: 6).fill(hovering ? Color.primary.opacity(0.06) : .clear))
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .onTapGesture { store.toggleCollapsed(group.slug) }
+    }
+}
+
+/// Hand-pinned PRs, always shown expanded at the top of the list.
+struct PinnedSection: View {
+    @EnvironmentObject var store: Store
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "pin.fill").font(.system(size: 9))
+                Text("Pinned")
+                Spacer()
+                Text("\(store.pinnedPRs.count)").font(.system(size: 10))
+            }
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(.orange)
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.08))
+
+            ForEach(store.pinnedPRs) { pr in
+                PRRow(pr: pr)
+                Divider()
+            }
+        }
     }
 }
 
@@ -521,5 +1404,88 @@ struct Pill: View {
             .foregroundStyle(color)
             .padding(.horizontal, 6).padding(.vertical, 2)
             .background(color.opacity(0.2), in: Capsule())
+    }
+}
+
+
+/// Everything you worked on since the last report, grouped by repository.
+struct WorkReportView: View {
+    @EnvironmentObject var store: Store
+    @Binding var isShown: Bool
+    @State private var text = ""
+    @State private var html = ""
+    @State private var since: Date?
+    @State private var until: Date?
+    @State private var loading = true
+    @State private var error: String?
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Work report").font(.headline)
+                Spacer()
+                if let since {
+                    Text("since \(since.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            if loading {
+                ProgressView().frame(maxWidth: .infinity, minHeight: 120)
+            } else if let error {
+                Text(error).font(.callout).foregroundStyle(.red)
+            } else {
+                FieldBox {
+                    ScrollView {
+                        Text(verbatim: text)
+                            .font(.system(size: 12, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .noScrollEdgeShadow()
+                    .frame(minHeight: 120, idealHeight: 260, maxHeight: 340)
+                }
+            }
+
+            HStack {
+                Button("Back") { isShown = false }
+                Spacer()
+                Button(copied ? "Copied ✓" : "Copy") {
+                    Store.copyToPasteboard(text, html: html)
+                    copied = true
+                }
+                .disabled(loading || error != nil)
+                Button("Retain") { isShown = false }
+                    .help("Keep this window; the next report covers this period again, plus anything new")
+                Button("Reset") {
+                    if let until { store.resetWorkReportWindow(until: until) }
+                    isShown = false
+                }
+                .keyboardShortcut(.defaultAction)
+                .help("Start the next report from now")
+                .disabled(loading || error != nil)
+            }
+            Text(verbatim: "Copies as rich text for Slack and as markdown for editors. Retain keeps the start time for the next report; Reset starts the next one from now.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .task { await load() }
+    }
+
+    private func load() async {
+        loading = true
+        error = nil
+        copied = false
+        do {
+            let report = try await store.buildWorkReport()
+            text = report.text
+            html = report.html
+            since = report.since
+            until = report.until
+        } catch {
+            self.error = error.localizedDescription
+        }
+        loading = false
     }
 }

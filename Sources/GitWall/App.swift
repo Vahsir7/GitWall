@@ -8,6 +8,7 @@ struct GitWallApp: App {
 
     init() {
         UNUserNotificationCenter.current().delegate = notifDelegate
+        Notifier.registerCategories()
         Task { await Notifier.requestAccess() }
     }
 
