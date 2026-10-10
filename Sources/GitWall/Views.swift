@@ -489,6 +489,10 @@ struct PRRow: View {
     /// Opened just this one row while the list is compact.
     @State private var expandedHere = false
     private var compact: Bool { compactSetting && !expandedHere }
+    /// Room kept clear on the right for the always-visible comment badge and chevron.
+    private var hoverActionsInset: CGFloat {
+        10 + (compactSetting ? 26 : 0) + (pr.unresolvedThreads > 0 ? 56 : 0)
+    }
 
     private var tint: Color {
         if pr.isMerged { return .purple }
@@ -621,6 +625,29 @@ struct PRRow: View {
                 }
             }
 
+
+            // Pinned to the far right so it never shifts when hover actions appear.
+            if compactSetting {
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { expandedHere.toggle() }
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .rotationEffect(.degrees(expandedHere ? 180 : 0))
+                        .frame(width: 20, height: 18)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .hoverHighlight()
+                .help(expandedHere ? "Collapse" : "Show details")
+            }
+
+        }
+        .padding(.leading, 12).padding(.trailing, 10).padding(.vertical, compact ? 6 : 10)
+        // Hover actions float over the row instead of taking layout space, so
+        // the content doesn't reflow (and grow taller) when the pointer enters.
+        .overlay(alignment: .topTrailing) {
             if hovering {
                 HStack(spacing: 2) {
                     Menu {
@@ -664,27 +691,12 @@ struct PRRow: View {
                 .foregroundStyle(.secondary)
                 .font(.system(size: 12))
                 .transition(.move(edge: .trailing).combined(with: .opacity))
+                .padding(.horizontal, 4).padding(.vertical, 2)
+                .background(.regularMaterial, in: Capsule())
+                .padding(.top, compact ? 4 : 8)
+                .padding(.trailing, hoverActionsInset)
             }
-
-            // Pinned to the far right so it never shifts when hover actions appear.
-            if compactSetting {
-                Button {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { expandedHere.toggle() }
-                } label: {
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 10, weight: .semibold))
-                        .rotationEffect(.degrees(expandedHere ? 180 : 0))
-                        .frame(width: 20, height: 18)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .hoverHighlight()
-                .help(expandedHere ? "Collapse" : "Show details")
-            }
-
         }
-        .padding(.leading, 12).padding(.trailing, 10).padding(.vertical, compact ? 6 : 10)
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(glass ? AnyShapeStyle(Color.primary.opacity(hovering ? 0.09 : 0.05))
