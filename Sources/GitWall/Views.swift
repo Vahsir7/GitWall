@@ -531,10 +531,11 @@ struct PRRow: View {
                     .lineLimit(2)
                     .font(.system(size: 13, weight: .semibold))
 
-                HStack(spacing: 5) {
+                // Wraps onto new lines instead of squeezing badges when space is tight.
+                FlowLayout(spacing: 5) {
                     // The repo lives in the section header, so only the number here.
                     StateBadge(state: pr.state)
-                    Text("#\(pr.number)" + (pr.author.isEmpty ? "" : " by \(pr.author)")).foregroundStyle(.secondary)
+                    Text("#\(pr.number)" + (pr.author.isEmpty ? "" : " by \(pr.author)")).foregroundStyle(.secondary).lineLimit(1).fixedSize()
                     if pr.isPinned { Tag("pinned", .orange) }
                     if pr.isOngoing { Tag("working on it", .teal) }
                     if let mine = pr.myReview(login: store.account?.login) {
@@ -826,6 +827,7 @@ struct StateBadge: View {
             Text(state.label)
         }
         .padding(.horizontal, 5).padding(.vertical, 1)
+        .fixedSize()
         .background(color.opacity(0.15), in: Capsule())
         .foregroundStyle(color)
         .help(state == .conflict ? "This branch has conflicts with the base branch" : state.label)
@@ -843,6 +845,7 @@ struct ReviewerStrip: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(summary)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 FlowRow(reviewers) { r in chip(r) }
             }
             .font(.system(size: 10))
@@ -1025,6 +1028,8 @@ struct Tag: View {
             Text(text)
         }
             .padding(.horizontal, 5).padding(.vertical, 1)
+            .lineLimit(1)
+            .fixedSize()
             .background(color.opacity(0.15), in: Capsule())
             .foregroundStyle(color)
     }
