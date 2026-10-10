@@ -598,22 +598,6 @@ struct PRRow: View {
 
             Spacer(minLength: 0)
 
-            if compactSetting {
-                Button {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { expandedHere.toggle() }
-                } label: {
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 10, weight: .semibold))
-                        .rotationEffect(.degrees(expandedHere ? 180 : 0))
-                        .frame(width: 20, height: 18)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .hoverHighlight()
-                .help(expandedHere ? "Collapse" : "Show details")
-            }
-
             if pr.unresolvedThreads > 0 {
                 Button { showComments.toggle() } label: {
                     HStack(spacing: 3) {
@@ -678,7 +662,26 @@ struct PRRow: View {
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
                 .font(.system(size: 12))
+                .transition(.move(edge: .trailing).combined(with: .opacity))
             }
+
+            // Pinned to the far right so it never shifts when hover actions appear.
+            if compactSetting {
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { expandedHere.toggle() }
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .rotationEffect(.degrees(expandedHere ? 180 : 0))
+                        .frame(width: 20, height: 18)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .hoverHighlight()
+                .help(expandedHere ? "Collapse" : "Show details")
+            }
+
         }
         .padding(.leading, 12).padding(.trailing, 10).padding(.vertical, compact ? 6 : 10)
         .background(
@@ -696,7 +699,7 @@ struct PRRow: View {
             .strokeBorder(Color.primary.opacity(hovering ? 0.12 : 0.06)))
         .contentShape(Rectangle())
         .animation(.easeOut(duration: 0.12), value: hovering)
-        .onHover { hovering = $0 }
+        .onHover { h in withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) { hovering = h } }
         .onTapGesture {
             if let u = URL(string: pr.url) { NSWorkspace.shared.open(u) }
         }
