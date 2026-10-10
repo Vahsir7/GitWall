@@ -290,7 +290,8 @@ actor GitHub {
     }
 
     /// Full detail for one PR: review verdict, re-review requests, CI.
-    func detail(_ ref: PRRef, viewer: String, teams: Set<String> = []) async throws -> PullRequest {
+    func detail(_ ref: PRRef, viewer: String, teams: Set<String> = [],
+                rules: [ReviewRule] = ReviewRule.defaults) async throws -> PullRequest {
         let base = "/repos/\(ref.owner)/\(ref.repo)/pulls/\(ref.number)"
         let pr = try decode(PRPayload.self, await get(base))
         let reviews = try decode([Review].self, await get(base + "/reviews?per_page=100"))
@@ -354,24 +355,32 @@ actor GitHub {
             out.verdict = .none
         }
 
-        // Bot reviews and bot comments can both carry a findings table; keep
-        // each bot's most recent one.
-        var posts: [(login: String, body: String, at: Date)] = reviews.compactMap {
-            guard let l = $0.user?.login, let b = $0.body else { return nil }
-            return (l, b, $0.submitted_at ?? .distantPast)
+        // Reviews and PR comments can both carry a severity table; the user's
+        // rules say whose posts to read and which columns to look for. Keep the
+        // most recent table per rule (and per author when the rule has no name).
+        var posts: [(login: String, body: String, at: Date, isReview: Bool)] = reviews.compactMap {
+            guard let l = $0.user?.login, let b = $0.body, !b.isEmpty else { return nil }
+            return (l, b, $0.submitted_at ?? .distantPast, true)
         }
-        if let d = try? await get("/repos/\(ref.owner)/\(ref.repo)/issues/\(ref.number)/comments?per_page=100"),
+        if rules.contains(where: { $0.enabled && $0.whereFrom != .reviews }),
+           let d = try? await get("/repos/\(ref.owner)/\(ref.repo)/issues/\(ref.number)/comments?per_page=100"),
            let comments = try? decode([IssueComment].self, d) {
             posts += comments.compactMap {
                 guard let l = $0.user?.login, let b = $0.body else { return nil }
-                return (l, b, $0.created_at)
+                return (l, b, $0.created_at, false)
             }
         }
         var findings: [String: (BotFindings, Date)] = [:]
-        for p in posts where p.login.lowercased().hasSuffix("[bot]") {
-            guard let f = BotFindings.parse(p.body, login: p.login) else { continue }
-            if let cur = findings[p.login], cur.1 > p.at { continue }
-            findings[p.login] = (f, p.at)
+        for p in posts {
+            for rule in rules where rule.matches(author: p.login, isReview: p.isReview, body: p.body) {
+                let name = rule.name.trimmingCharacters(in: .whitespaces)
+                let shown = name.isEmpty ? p.login : name
+                guard let f = BotFindings.parse(p.body, login: shown, labels: rule.labelList) else { continue }
+                let key = "\(rule.id)|\(shown)"
+                if let cur = findings[key], cur.1 > p.at { continue }
+                findings[key] = (f, p.at)
+                break   // first matching rule wins for this post
+            }
         }
         out.botFindings = findings.values.map(\.0).sorted { $0.login < $1.login }
 

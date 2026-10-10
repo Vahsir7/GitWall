@@ -217,22 +217,103 @@ struct ReviewThread: Codable, Hashable, Identifiable {
     var url: String
 }
 
-/// One bot's findings table, e.g. J-Bot's "Findings Summary".
+/// A user-defined rule for reading a severity table out of a review or comment,
+/// e.g. a review bot's "Findings Summary" (Total | P0 | P1 | P2 | P3 | nit).
+struct ReviewRule: Codable, Identifiable, Hashable {
+    enum Where: String, Codable, CaseIterable {
+        case both, reviews, comments
+        var label: String {
+            switch self {
+            case .both: return "Reviews & comments"
+            case .reviews: return "Reviews only"
+            case .comments: return "Comments only"
+            }
+        }
+    }
+
+    var id = UUID()
+    /// Shown on the row; empty means "use the author's login".
+    var name: String = ""
+    /// Comma-separated logins or patterns with `*`, e.g. "*[bot], alice".
+    var authors: String = "*[bot]"
+    var whereFrom: Where = .both
+    /// Optional text the post must contain, e.g. "Findings Summary".
+    var marker: String = ""
+    /// Comma-separated severity columns, most severe first.
+    var labels: String = "P0, P1, P2, P3, nit"
+    var enabled = true
+
+    init(id: UUID = UUID(), name: String = "", authors: String = "*[bot]", whereFrom: Where = .both,
+         marker: String = "", labels: String = "P0, P1, P2, P3, nit", enabled: Bool = true) {
+        self.id = id; self.name = name; self.authors = authors; self.whereFrom = whereFrom
+        self.marker = marker; self.labels = labels; self.enabled = enabled
+    }
+
+    // Tolerates rules saved by an older build missing newer fields.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        authors = try c.decodeIfPresent(String.self, forKey: .authors) ?? "*[bot]"
+        whereFrom = try c.decodeIfPresent(Where.self, forKey: .whereFrom) ?? .both
+        marker = try c.decodeIfPresent(String.self, forKey: .marker) ?? ""
+        labels = try c.decodeIfPresent(String.self, forKey: .labels) ?? "P0, P1, P2, P3, nit"
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+    }
+
+    /// The out-of-the-box rule: any bot account, P0–P3 + nit. This is exactly
+    /// what GitWall did before rules were configurable.
+    static let defaults = [ReviewRule()]
+
+    var labelList: [String] {
+        labels.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    func matches(author login: String, isReview: Bool, body: String) -> Bool {
+        guard enabled else { return false }
+        if whereFrom == .reviews && !isReview { return false }
+        if whereFrom == .comments && isReview { return false }
+        let m = marker.trimmingCharacters(in: .whitespaces)
+        if !m.isEmpty && body.range(of: m, options: .caseInsensitive) == nil { return false }
+        return authors.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .contains { Self.glob($0, login) }
+    }
+
+    /// Case-insensitive match where `*` stands for any run of characters.
+    static func glob(_ pattern: String, _ text: String) -> Bool {
+        let escaped = NSRegularExpression.escapedPattern(for: pattern).replacingOccurrences(of: "\\*", with: ".*")
+        return text.range(of: "^\(escaped)$", options: [.regularExpression, .caseInsensitive]) != nil
+    }
+}
+
+/// One severity table read from a review or comment.
 struct BotFindings: Codable, Hashable, Identifiable {
+    /// The rule's name, or the author's login when the rule has none.
     var login: String
     /// Non-zero severities in table order, e.g. [("P2", 2)].
     var counts: [Count]
     var id: String { login }
 
-    struct Count: Codable, Hashable { var severity: String; var n: Int }
+    struct Count: Codable, Hashable {
+        var severity: String
+        var n: Int
+        /// Position in the rule's label list; drives the colour (0 = most severe).
+        var rank: Int = 0
+    }
 
     var displayName: String {
         login.replacingOccurrences(of: "[bot]", with: "", options: .caseInsensitive)
     }
 
-    /// Finds a header row containing P0 and P1 and reads the next row of numbers.
+    /// Finds a header row naming the rule's severity labels (at least two of
+    /// them, or the one if only one is set) and reads the next row of numbers.
     /// Handles markdown pipe tables and tab/space separated text.
-    static func parse(_ body: String, login: String) -> BotFindings? {
+    static func parse(_ body: String, login: String,
+                      labels: [String] = ["P0", "P1", "P2", "P3", "nit"]) -> BotFindings? {
+        let wanted = labels.map { $0.lowercased() }
+        guard !wanted.isEmpty else { return nil }
         func cells(_ line: String) -> [String] {
             line.split(whereSeparator: { $0 == "|" || $0 == "\t" || $0 == " " })
                 .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -241,16 +322,17 @@ struct BotFindings: Codable, Hashable, Identifiable {
         let lines = body.components(separatedBy: .newlines)
         for (i, line) in lines.enumerated() {
             let header = cells(line)
-            let upper = header.map { $0.uppercased() }
-            guard upper.contains("P0"), upper.contains("P1") else { continue }
+            let lower = header.map { $0.lowercased() }
+            guard lower.filter(wanted.contains).count >= min(2, wanted.count) else { continue }
             for next in lines.dropFirst(i + 1) {
                 let row = cells(next)
                 if row.isEmpty || row.allSatisfy({ $0.allSatisfy { "-:".contains($0) } }) { continue }
                 let nums = row.compactMap(Int.init)
                 guard nums.count == header.count else { break }
-                let counts = zip(header, nums)
-                    .filter { $0.0.lowercased() != "total" && $0.1 > 0 }
-                    .map { Count(severity: $0.0, n: $0.1) }
+                let counts = zip(header, nums).compactMap { col, n -> Count? in
+                    guard n > 0, let rank = wanted.firstIndex(of: col.lowercased()) else { return nil }
+                    return Count(severity: col, n: n, rank: rank)
+                }
                 return BotFindings(login: login, counts: counts)
             }
         }

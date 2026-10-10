@@ -40,6 +40,8 @@ final class Store: ObservableObject {
         .appendingPathComponent("GitWall/watched.json")
     private let prefsURL = URL.applicationSupportDirectory
         .appendingPathComponent("GitWall/prefs.json")
+    private let rulesURL = URL.applicationSupportDirectory
+        .appendingPathComponent("GitWall/review-rules.json")
     private let promptsURL = URL.applicationSupportDirectory
         .appendingPathComponent("GitWall/prompts.json")
 
@@ -71,6 +73,7 @@ final class Store: ObservableObject {
         loadWatched()
         loadPrefs()
         loadPrompts()
+        loadRules()
         NotificationDelegate.onAction = { [weak self] action, id in
             guard let self, let pr = self.prs.first(where: { $0.id == id }) else { return }
             if action == Notifier.ignoreAction { self.setIgnored(pr, true) }
@@ -209,7 +212,7 @@ final class Store: ObservableObject {
                     if isWithinRetention(old) { lingering.append(old) }
                     continue
                 }
-                guard var pr = try? await api.detail(ref, viewer: login, teams: teams),
+                guard var pr = try? await api.detail(ref, viewer: login, teams: teams, rules: reviewRules),
                       pr.isMerged || pr.isClosed else { continue }
                 pr.sources = old.sources
                 if isWithinRetention(pr) { lingering.append(pr) }
@@ -217,7 +220,7 @@ final class Store: ObservableObject {
 
             var fresh: [PullRequest] = []
             for ref in refs.values {
-                var pr = try await api.detail(ref, viewer: login, teams: teams)
+                var pr = try await api.detail(ref, viewer: login, teams: teams, rules: reviewRules)
                 pr.sources = sources[ref.id] ?? []
                 // A pasted link stays forever, but once it's done it ages out too.
                 if (pr.isMerged || pr.isClosed) && !isWithinRetention(pr) { continue }
@@ -348,6 +351,23 @@ final class Store: ObservableObject {
             NSPasteboard.general.setString(html, forType: .html)
         }
         NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    /// How severity tables are read from reviews and comments. Edited in Settings.
+    @Published var reviewRules: [ReviewRule] = ReviewRule.defaults {
+        didSet { saveRules() }
+    }
+
+    private func loadRules() {
+        guard let data = try? Data(contentsOf: rulesURL),
+              let saved = try? JSONDecoder().decode([ReviewRule].self, from: data) else { return }
+        reviewRules = saved
+    }
+
+    private func saveRules() {
+        try? FileManager.default.createDirectory(
+            at: rulesURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? JSONEncoder().encode(reviewRules).write(to: rulesURL)
     }
 
     private func loadPrompts() {

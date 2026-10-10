@@ -585,7 +585,7 @@ struct PRRow: View {
                             Tag("no findings", .green)
                         }
                         ForEach(f.counts, id: \.severity) { c in
-                            Tag("\(c.severity) · \(c.n)", severityColor(c.severity))
+                            Tag("\(c.severity) · \(c.n)", SeverityColor.forRank(c.rank))
                         }
                     }
                     .font(.system(size: 10))
@@ -796,16 +796,6 @@ struct PRRow: View {
         }
     }
 
-    private func severityColor(_ s: String) -> Color {
-        switch s.uppercased() {
-        case "P0": return .red
-        case "P1": return .orange
-        case "P2": return .yellow
-        case "P3": return .blue
-        default: return .secondary
-        }
-    }
-
     private func sourceLabel(_ s: Source) -> String {
         switch s {
         case .assigned: return "assigned"
@@ -949,6 +939,116 @@ struct FlowLayout: Layout {
             rows[rows.count - 1] = row
         }
         return rows.filter { !$0.indices.isEmpty }
+    }
+}
+
+enum SeverityColor {
+    /// Most severe first: red, orange, yellow, blue, then grey.
+    static func forRank(_ rank: Int) -> Color {
+        [Color.red, .orange, .yellow, .blue][safe: rank] ?? .secondary
+    }
+}
+
+extension Array {
+    subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil }
+}
+
+/// Settings editor for review-summary rules, with a live test box.
+struct ReviewRulesSection: View {
+    @EnvironmentObject var store: Store
+    @State private var sample = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Review summaries").font(.headline)
+                Spacer()
+                Button {
+                    store.reviewRules.append(ReviewRule(name: "New rule", authors: ""))
+                } label: { Label("Add", systemImage: "plus") }
+                    .buttonStyle(.borderless)
+            }
+            Text("Show severity counts from a review bot or person. GitWall finds a table whose header names your labels (e.g. Total | P0 | P1 | P2) and shows the non-zero counts on the PR.")
+                .font(.caption).foregroundStyle(.secondary)
+
+            ForEach(store.reviewRules) { rule in
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        Toggle("", isOn: binding(rule.id).enabled).labelsHidden().toggleStyle(.switch)
+                            .controlSize(.mini)
+                        FieldBox {
+                            TextField("Name shown (blank = author's login)", text: binding(rule.id).name)
+                                .textFieldStyle(.plain)
+                        }
+                        Button {
+                            store.reviewRules.removeAll { $0.id == rule.id }
+                        } label: { Image(systemName: "trash") }
+                            .buttonStyle(.borderless)
+                            .help("Delete this rule")
+                    }
+                    labeled("Authors") {
+                        TextField("*[bot], alice", text: binding(rule.id).authors).textFieldStyle(.plain)
+                    }
+                    labeled("Contains") {
+                        TextField("optional, e.g. Findings Summary", text: binding(rule.id).marker).textFieldStyle(.plain)
+                    }
+                    labeled("Labels") {
+                        TextField("P0, P1, P2, P3, nit", text: binding(rule.id).labels).textFieldStyle(.plain)
+                    }
+                    Picker("Read from", selection: binding(rule.id).whereFrom) {
+                        ForEach(ReviewRule.Where.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
+                    .controlSize(.small)
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+            }
+
+            Text("Test a rule").font(.subheadline.weight(.semibold)).padding(.top, 4)
+            FieldBox {
+                TextEditor(text: $sample)
+                    .font(.system(size: 11, design: .monospaced))
+                    .scrollContentBackground(.hidden)
+                    .noScrollEdgeShadow()
+                    .frame(minHeight: 54, maxHeight: 100)
+            }
+            if !sample.isEmpty {
+                ForEach(store.reviewRules.filter(\.enabled)) { rule in
+                    HStack(spacing: 4) {
+                        Text(rule.name.isEmpty ? "Rule" : rule.name).font(.caption.weight(.semibold))
+                        if let f = BotFindings.parse(sample, login: rule.name, labels: rule.labelList) {
+                            if f.counts.isEmpty { Tag("no findings", .green) }
+                            ForEach(f.counts, id: \.severity) { c in
+                                Tag("\(c.severity) · \(c.n)", SeverityColor.forRank(c.rank))
+                            }
+                        } else {
+                            Text("no table found").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .font(.system(size: 10))
+                }
+            } else {
+                Text("Paste a sample review or comment to preview what each rule reads.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func labeled<C: View>(_ title: String, @ViewBuilder _ field: () -> C) -> some View {
+        HStack(spacing: 6) {
+            Text(title).font(.caption).foregroundStyle(.secondary).frame(width: 58, alignment: .leading)
+            FieldBox { field() }
+        }
+    }
+
+    private func binding(_ id: UUID) -> Binding<ReviewRule> {
+        Binding(
+            get: { store.reviewRules.first { $0.id == id } ?? ReviewRule() },
+            set: { updated in
+                if let i = store.reviewRules.firstIndex(where: { $0.id == id }) {
+                    store.reviewRules[i] = updated
+                }
+            })
     }
 }
 
@@ -1096,6 +1196,10 @@ struct SettingsView: View {
             Divider()
 
             promptsSection
+
+            Divider()
+
+            ReviewRulesSection()
 
             Divider()
 
