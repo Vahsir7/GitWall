@@ -518,7 +518,7 @@ struct PRRow: View {
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(StateBadge.color(pr.state))
                         .help(pr.state.label)
-                    Text("#\(pr.number)" + (pr.author.isEmpty ? "" : " by \(pr.author)")).foregroundStyle(.secondary)
+                    Text("#\(pr.number)").foregroundStyle(.secondary)
                     Text(pr.title.isEmpty ? pr.slug : pr.title)
                         .lineLimit(1)
                         .truncationMode(.tail)
