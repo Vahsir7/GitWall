@@ -518,7 +518,7 @@ struct PRRow: View {
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(StateBadge.color(pr.state))
                         .help(pr.state.label)
-                    Text("#\(pr.number)").foregroundStyle(.secondary)
+                    Text("#\(pr.number)" + (pr.author.isEmpty ? "" : " by \(pr.author)")).foregroundStyle(.secondary)
                     Text(pr.title.isEmpty ? pr.slug : pr.title)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -534,7 +534,7 @@ struct PRRow: View {
                 HStack(spacing: 5) {
                     // The repo lives in the section header, so only the number here.
                     StateBadge(state: pr.state)
-                    Text("#\(pr.number)").foregroundStyle(.secondary)
+                    Text("#\(pr.number)" + (pr.author.isEmpty ? "" : " by \(pr.author)")).foregroundStyle(.secondary)
                     if pr.isPinned { Tag("pinned", .orange) }
                     if pr.isOngoing { Tag("working on it", .teal) }
                     if let mine = pr.myReview(login: store.account?.login) {
