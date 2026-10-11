@@ -44,6 +44,28 @@ actor GitHub {
     }
 
     /// GraphQL call; returns the `data` object, throws on transport or GraphQL errors.
+    /// Merges the base branch into the PR branch, like GitHub's "Update branch".
+    /// `expectedSha` guards against updating a head that moved since we looked.
+    func updateBranch(_ ref: PRRef, expectedSha: String) async throws {
+        guard let token else { throw GitHubError.noToken }
+        var req = URLRequest(url: URL(string:
+            "https://api.github.com/repos/\(ref.owner)/\(ref.repo)/pulls/\(ref.number)/update-branch")!)
+        req.httpMethod = "PUT"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        req.setValue("GitWall", forHTTPHeaderField: "User-Agent")
+        if !expectedSha.isEmpty {
+            req.httpBody = try JSONSerialization.data(withJSONObject: ["expected_head_sha": expectedSha])
+        }
+        let (data, resp) = try await session.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(code) else {
+            let msg = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["message"] as? String
+            throw GitHubError.http(code, msg ?? String(data: data, encoding: .utf8) ?? "")
+        }
+    }
+
     private func graphql(_ query: String, _ variables: [String: Any]) async throws -> [String: Any] {
         guard let token else { throw GitHubError.noToken }
         var req = URLRequest(url: URL(string: "https://api.github.com/graphql")!)
@@ -307,6 +329,8 @@ actor GitHub {
         out.finishedAt = pr.merged_at ?? pr.closed_at
         // mergeable is null while GitHub is still computing it; treat as clean.
         out.hasConflicts = pr.mergeable == false || pr.mergeable_state == "dirty"
+        out.isBehind = pr.mergeable_state == "behind"
+        out.headSha = pr.head.sha
 
         // Latest meaningful review per reviewer. COMMENTED never overrides an
         // earlier APPROVED / CHANGES_REQUESTED — that's GitHub's own rule.
