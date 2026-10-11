@@ -673,13 +673,13 @@ struct PRRow: View {
                     .hoverHighlight()
                     .help("Copy the link or a saved prompt")
 
-                    if !pr.isMerged && !pr.isClosed {
+                    if pr.isBehind && !pr.isMerged && !pr.isClosed {
                         Button { Task { await store.updateBranch(pr) } } label: {
                             Image(systemName: "arrow.triangle.merge")
                         }
                         .disabled(store.updatingBranch.contains(pr.id))
                         .hoverHighlight()
-                        .help(pr.isBehind ? "Update branch from base (behind)" : "Update branch from base")
+                        .help("Update branch from base")
                     }
 
                     Button { store.setPinned(pr, !pr.isPinned) } label: {
@@ -758,8 +758,8 @@ struct PRRow: View {
             Button(pr.isPinned ? "Unpin" : "Pin to the top") {
                 store.setPinned(pr, !pr.isPinned)
             }
-            if !pr.isMerged && !pr.isClosed {
-                Button(pr.isBehind ? "Update branch (behind base)" : "Update branch") {
+            if pr.isBehind && !pr.isMerged && !pr.isClosed {
+                Button("Update branch") {
                     Task { await store.updateBranch(pr) }
                 }
             }

@@ -165,8 +165,12 @@ actor GitHub {
         let requested_reviewers: [User]?
         let requested_teams: [Team]?
         let head: Head
+        let base: Base
         struct Head: Decodable { let sha: String }
+        struct Base: Decodable { let ref: String }
     }
+
+    private struct Compare: Decodable { let behind_by: Int }
 
     private struct Review: Decodable {
         let user: User?
@@ -329,7 +333,15 @@ actor GitHub {
         out.finishedAt = pr.merged_at ?? pr.closed_at
         // mergeable is null while GitHub is still computing it; treat as clean.
         out.hasConflicts = pr.mergeable == false || pr.mergeable_state == "dirty"
+        // mergeable_state only says "behind" in some repos, so ask GitHub how
+        // many base commits the head is missing.
         out.isBehind = pr.mergeable_state == "behind"
+        if !out.isMerged && !out.isClosed,
+           let base = pr.base.ref.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+           let d = try? await get("/repos/\(ref.owner)/\(ref.repo)/compare/\(base)...\(pr.head.sha)?per_page=1"),
+           let cmp = try? decode(Compare.self, d) {
+            out.isBehind = cmp.behind_by > 0
+        }
         out.headSha = pr.head.sha
 
         // Latest meaningful review per reviewer. COMMENTED never overrides an
