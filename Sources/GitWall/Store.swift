@@ -324,6 +324,36 @@ final class Store: ObservableObject {
     }
 
     /// Resolves every open review thread on the PR, then refreshes.
+    /// PR id -> head sha before we updated its branch. Cleared once the checks
+    /// on the new head finish and we've said how they went.
+    @Published private(set) var ciWatch: [String: String] = [:]
+    @Published private(set) var updatingBranch: Set<String> = []
+    private var ciWatchStarted: [String: Date] = [:]
+
+    /// GitHub's "Update branch": merge the base into the PR branch, then watch
+    /// the new head's checks and notify when they pass or fail.
+    func updateBranch(_ pr: PullRequest) async {
+        updatingBranch.insert(pr.id)
+        defer { updatingBranch.remove(pr.id) }
+        do {
+            try await api.updateBranch(PRRef(owner: pr.owner, repo: pr.repo, number: pr.number),
+                                       expectedSha: pr.headSha)
+            ciWatch[pr.id] = pr.headSha
+            ciWatchStarted[pr.id] = Date()
+            errorText = nil
+            Notifier.post(title: "Branch updated — \(pr.slug)",
+                          body: "Watching checks; you'll be notified when they finish.", url: pr.url, prID: pr.id)
+        } catch {
+            errorText = "Couldn't update \(pr.slug): \(error.localizedDescription)"
+            return
+        }
+        // GitHub takes a moment to create the merge commit.
+        try? await Task.sleep(for: .seconds(3))
+        await refresh()
+    }
+
+    func isWatchingCI(_ pr: PullRequest) -> Bool { ciWatch[pr.id] != nil }
+
     func resolveAllComments(_ pr: PullRequest) async {
         do {
             _ = try await api.resolveAllThreads(PRRef(owner: pr.owner, repo: pr.repo, number: pr.number))
@@ -446,6 +476,30 @@ final class Store: ObservableObject {
     /// Only fires on a *transition*, so a PR that has been red for a week
     /// doesn't re-notify every poll. First sighting is never announced.
     private func notifyChanges(new: [PullRequest]) {
+        let previousWatch = ciWatch
+        // Branches we updated: report once checks on the new head settle.
+        for pr in new {
+            guard let oldSha = ciWatch[pr.id] else { continue }
+            if pr.isMerged || pr.isClosed { ciWatch[pr.id] = nil; continue }
+            guard pr.headSha != oldSha, pr.ci != .pending else { continue }
+            // Checks can take a while to register on a new commit; only call it
+            // "no checks" after 10 minutes of seeing none.
+            if pr.ci == .none,
+               Date().timeIntervalSince(ciWatchStarted[pr.id] ?? .distantPast) < 600 { continue }
+            ciWatchStarted[pr.id] = nil
+            ciWatch[pr.id] = nil
+            switch pr.ci {
+            case .success:
+                Notifier.post(title: "Checks passed — \(pr.slug)", body: "After updating the branch · \(pr.title)",
+                              url: pr.url, prID: pr.id)
+            case .failure:
+                Notifier.post(title: "Checks failed — \(pr.slug)", body: "After updating the branch · \(pr.title)",
+                              url: pr.url + "/checks", prID: pr.id)
+            default:
+                Notifier.post(title: "Branch updated — \(pr.slug)", body: "No checks ran on the new commit.",
+                              url: pr.url, prID: pr.id)
+            }
+        }
         for pr in new {
             guard !pr.isIgnored else { continue }
             guard let old = previous[pr.id], old.fingerprint != pr.fingerprint else { continue }
@@ -470,7 +524,7 @@ final class Store: ObservableObject {
                 // Was marked "working on it", but a reviewer has since spoken.
                 Notifier.post(title: "New review activity — \(pr.slug)",
                               body: pr.title, url: pr.url, prID: pr.id)
-            } else if notifyCI && pr.ci == .failure && old.ci != .failure {
+            } else if notifyCI && pr.ci == .failure && old.ci != .failure && previousWatch[pr.id] == nil {
                 Notifier.post(title: "Checks failing — \(pr.slug)", body: pr.title, url: pr.url, prID: pr.id)
             }
         }

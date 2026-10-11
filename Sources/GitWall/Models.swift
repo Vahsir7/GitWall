@@ -93,6 +93,10 @@ struct PullRequest: Codable, Identifiable, Hashable {
     var finishedAt: Date?
     /// GitHub reports merge conflicts with the base branch.
     var hasConflicts: Bool = false
+    /// The branch is missing commits from its base ("Update branch" on GitHub).
+    var isBehind: Bool = false
+    /// Head commit; a new value means new commits (e.g. after updating the branch).
+    var headSha: String = ""
 
     var verdict: ReviewVerdict = .none
     var ci: CIStatus = .none

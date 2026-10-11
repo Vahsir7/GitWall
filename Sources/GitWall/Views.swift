@@ -549,6 +549,17 @@ struct PRRow: View {
                     }
                     if pr.isIgnored { Tag("ignored", .secondary) }
                     if pr.isMenuBarMuted { Tag("not in menu bar", .secondary, symbol: "menubar.rectangle") }
+                    if store.updatingBranch.contains(pr.id) {
+                        Tag("updating branch…", .blue, symbol: "arrow.triangle.2.circlepath")
+                    } else if store.isWatchingCI(pr) {
+                        Tag("watching checks", .blue, symbol: "bell.badge")
+                    } else if pr.isBehind && !pr.isMerged && !pr.isClosed {
+                        Button { Task { await store.updateBranch(pr) } } label: {
+                            Tag("behind · update branch", .blue, symbol: "arrow.triangle.merge")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Merge the base branch into this PR, then notify when checks finish")
+                    }
                     // Review sources are covered by the your-review tag above.
                     ForEach(Array(pr.sources.subtracting([.reviewRequest, .reviewed]))
                                 .sorted(by: { $0.rawValue < $1.rawValue }), id: \.self) { s in
@@ -662,6 +673,15 @@ struct PRRow: View {
                     .hoverHighlight()
                     .help("Copy the link or a saved prompt")
 
+                    if pr.isBehind && !pr.isMerged && !pr.isClosed {
+                        Button { Task { await store.updateBranch(pr) } } label: {
+                            Image(systemName: "arrow.triangle.merge")
+                        }
+                        .disabled(store.updatingBranch.contains(pr.id))
+                        .hoverHighlight()
+                        .help("Update branch from base")
+                    }
+
                     Button { store.setPinned(pr, !pr.isPinned) } label: {
                         Image(systemName: pr.isPinned ? "pin.slash" : "pin")
                     }
@@ -737,6 +757,11 @@ struct PRRow: View {
             }
             Button(pr.isPinned ? "Unpin" : "Pin to the top") {
                 store.setPinned(pr, !pr.isPinned)
+            }
+            if pr.isBehind && !pr.isMerged && !pr.isClosed {
+                Button("Update branch") {
+                    Task { await store.updateBranch(pr) }
+                }
             }
             if pr.unresolvedThreads > 0 {
                 Button("Resolve all comments (\(pr.unresolvedThreads))") { confirmResolve = true }
