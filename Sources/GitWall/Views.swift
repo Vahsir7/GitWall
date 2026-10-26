@@ -37,14 +37,32 @@ enum Theme {
 struct HoverHighlight: ViewModifier {
     var padding: CGFloat = 4
     @State private var hovering = false
+
+    /// How many highlighted controls the pointer is over right now. A row
+    /// ignores clicks while this is non-zero, so clicking a control — even on
+    /// the edge of its highlight — never also opens the PR.
+    @MainActor static var active = 0
+
     func body(content: Content) -> some View {
         content
             .padding(padding)
             .frame(minWidth: 24, minHeight: 22)
-            .background(RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color.primary.opacity(hovering ? 0.12 : 0)))
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.primary.opacity(hovering ? 0.12 : 0))
+                    // Swallow clicks on the highlight's padding the control itself doesn't take.
+                    .contentShape(Rectangle())
+                    .onTapGesture {}
+            )
             .contentShape(Rectangle())
-            .onHover { hovering = $0 }
+            .onHover { h in
+                guard h != hovering else { return }
+                hovering = h
+                Self.active += h ? 1 : -1
+            }
+            .onDisappear {
+                if hovering { Self.active -= 1; hovering = false }
+            }
             .animation(.easeOut(duration: 0.1), value: hovering)
     }
 }
@@ -713,7 +731,12 @@ struct PRRow: View {
                 .font(.system(size: 12))
                 .transition(.move(edge: .trailing).combined(with: .opacity))
                 .padding(.horizontal, 4).padding(.vertical, 2)
-                .background(.regularMaterial, in: Capsule())
+                .background(
+                    Capsule().fill(.regularMaterial)
+                        // Gaps between the buttons shouldn't open the PR either.
+                        .contentShape(Capsule())
+                        .onTapGesture {}
+                )
                 .padding(.top, compact ? 4 : 8)
                 .padding(.trailing, hoverActionsInset)
             }
@@ -737,7 +760,8 @@ struct PRRow: View {
         .onTapGesture {
             // Only a real click inside the focused panel opens the PR — not a
             // stray mouse-up from a window resize or a click meant for another window.
-            guard let e = NSApp.currentEvent, e.type == .leftMouseUp,
+            guard HoverHighlight.active == 0,
+                  let e = NSApp.currentEvent, e.type == .leftMouseUp,
                   e.window?.isKeyWindow == true, e.window?.inLiveResize == false,
                   let u = URL(string: pr.url) else { return }
             NSWorkspace.shared.open(u)
