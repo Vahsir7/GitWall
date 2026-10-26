@@ -164,7 +164,9 @@ struct RootView: View {
         // blur this one out.
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
             guard let w = note.object as? NSWindow, w === window else { return }
-            if w.occlusionState.contains(.visible) { playOpen() } else { appeared = false }
+            let visible = w.occlusionState.contains(.visible)
+            store.panelVisible = visible
+            if visible { playOpen() } else { appeared = false }
         }
         .onAppear { playOpen() }
         .onChange(of: sidebarCollapsed) { _, _ in resizeWindow() }
@@ -482,7 +484,6 @@ struct PRRow: View {
     @EnvironmentObject var store: Store
     let pr: PullRequest
     @State private var hovering = false
-    @State private var confirmResolve = false
     @State private var showComments = false
     @AppStorage("compactRows") private var compactSetting = false
     @Environment(\.glassTheme) private var glass
@@ -553,7 +554,7 @@ struct PRRow: View {
                         Tag("updating branch…", .blue, symbol: "arrow.triangle.2.circlepath")
                     } else if store.isWatchingCI(pr) {
                         Tag("watching checks", .blue, symbol: "bell.badge")
-                    } else if pr.isBehind && !pr.isMerged && !pr.isClosed {
+                    } else if pr.isBehind && !pr.hasConflicts && !pr.isMerged && !pr.isClosed {
                         Button { Task { await store.updateBranch(pr) } } label: {
                             Tag("behind · update branch", .blue, symbol: "arrow.triangle.merge")
                         }
@@ -631,7 +632,7 @@ struct PRRow: View {
                 .popover(isPresented: $showComments, arrowEdge: .trailing) {
                     UnresolvedComments(pr: pr) {
                         showComments = false
-                        confirmResolve = true
+                        Task { await store.resolveAllComments(pr) }
                     }
                 }
             }
@@ -673,7 +674,7 @@ struct PRRow: View {
                     .hoverHighlight()
                     .help("Copy the link or a saved prompt")
 
-                    if pr.isBehind && !pr.isMerged && !pr.isClosed {
+                    if pr.isBehind && !pr.hasConflicts && !pr.isMerged && !pr.isClosed {
                         Button { Task { await store.updateBranch(pr) } } label: {
                             Image(systemName: "arrow.triangle.merge")
                         }
@@ -734,14 +735,12 @@ struct PRRow: View {
         .animation(.easeOut(duration: 0.12), value: hovering)
         .onHover { h in withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) { hovering = h } }
         .onTapGesture {
-            if let u = URL(string: pr.url) { NSWorkspace.shared.open(u) }
-        }
-        .alert("Resolve \(pr.unresolvedThreads) comment threads on #\(pr.number)?",
-               isPresented: $confirmResolve) {
-            Button("Resolve all") { Task { await store.resolveAllComments(pr) } }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Marks every unresolved review thread as resolved on GitHub.")
+            // Only a real click inside the focused panel opens the PR — not a
+            // stray mouse-up from a window resize or a click meant for another window.
+            guard let e = NSApp.currentEvent, e.type == .leftMouseUp,
+                  e.window?.isKeyWindow == true, e.window?.inLiveResize == false,
+                  let u = URL(string: pr.url) else { return }
+            NSWorkspace.shared.open(u)
         }
         .contextMenu {
             Button("Open on GitHub") {
@@ -758,13 +757,13 @@ struct PRRow: View {
             Button(pr.isPinned ? "Unpin" : "Pin to the top") {
                 store.setPinned(pr, !pr.isPinned)
             }
-            if pr.isBehind && !pr.isMerged && !pr.isClosed {
+            if pr.isBehind && !pr.hasConflicts && !pr.isMerged && !pr.isClosed {
                 Button("Update branch") {
                     Task { await store.updateBranch(pr) }
                 }
             }
             if pr.unresolvedThreads > 0 {
-                Button("Resolve all comments (\(pr.unresolvedThreads))") { confirmResolve = true }
+                Button("Resolve all comments (\(pr.unresolvedThreads))") { Task { await store.resolveAllComments(pr) } }
             }
             ignoreButtons
             if pr.sources.contains(.watched) {

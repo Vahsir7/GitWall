@@ -83,6 +83,11 @@ final class Store: ObservableObject {
         token = TokenStore.load() ?? TokenStore.fromGHCLI() ?? ""
         Task { await api.setToken(token); await start() }
         Task { await refreshNotificationStatus() }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.refreshIfStale(after: 0) }
+        }
     }
 
     /// Re-checks the OS permission. Call this when Settings opens too, since
@@ -140,9 +145,43 @@ final class Store: ObservableObject {
         if !watched.contains(ref) {
             watched.append(ref)
             saveWatched()
-            Task { await refresh() }
+            if let i = prs.firstIndex(where: { $0.id == ref.id }) {
+                prs[i].sources.insert(.watched)
+            } else {
+                // Show it right away; the details fill in a moment later.
+                var placeholder = PullRequest(owner: ref.owner, repo: ref.repo, number: ref.number)
+                placeholder.url = "https://github.com/\(ref.owner)/\(ref.repo)/pull/\(ref.number)"
+                placeholder.sources = [.watched]
+                prs.insert(placeholder, at: 0)
+                Task { await loadOne(ref) }
+            }
         }
         return true
+    }
+
+    /// Fetches a single PR and slots it into the list, without a full refresh.
+    func loadOne(_ ref: PRRef) async {
+        guard let login = account?.login else { await refresh(); return }
+        do {
+            guard var pr = await api.details([ref], viewer: login, teams: myTeams ?? [],
+                                             rules: reviewRules)[ref.id] else {
+                throw GitHubError.http(404, "")
+            }
+            pr.sources = (prs.first { $0.id == ref.id }?.sources ?? []).union([.watched])
+            pr.isIgnored = prefs.ignored.contains(pr.id)
+            pr.isPinned = prefs.pinned.contains(pr.id)
+            pr.isMenuBarMuted = prefs.menuBarMuted.contains(pr.id)
+            pr.isOngoing = prefs.ongoing[pr.id] == pr.reviewSignature
+            previous[pr.id] = pr
+            if let i = prs.firstIndex(where: { $0.id == pr.id }) { prs[i] = pr } else { prs.append(pr) }
+            prs.sort {
+                ($0.attentionRank, $0.repoSlug, -$0.number) < ($1.attentionRank, $1.repoSlug, -$1.number)
+            }
+            await updateBehind()
+        } catch {
+            prs.removeAll { $0.id == ref.id && $0.title.isEmpty }
+            errorText = "Couldn't load \(ref.id): \(error.localizedDescription)"
+        }
     }
 
     func removeWatched(_ ref: PRRef) {
@@ -165,17 +204,31 @@ final class Store: ObservableObject {
 
     // MARK: - Polling
 
+    /// Whether the popover is on screen. While it is, GitWall polls more often.
+    @Published var panelVisible = false {
+        didSet { if panelVisible && !oldValue { refreshIfStale(after: 15) } }
+    }
+
+    /// Polls on a timer like GitHub Desktop: unchanged data costs almost nothing
+    /// thanks to ETags. Faster while the panel is open, the configured interval
+    /// otherwise, and an immediate catch-up when the panel opens or the Mac wakes.
     func start() async {
         timer?.cancel()
         await refresh()
         timer = Task { [weak self] in
             while !Task.isCancelled {
-                let secs = self?.pollSeconds ?? 120
-                try? await Task.sleep(for: .seconds(max(30, secs)))
+                guard let self else { return }
+                let secs = self.panelVisible ? min(30, self.pollSeconds) : self.pollSeconds
+                try? await Task.sleep(for: .seconds(max(20, secs)))
                 if Task.isCancelled { return }
-                await self?.refresh()
+                await self.refresh()
             }
         }
+    }
+
+    func refreshIfStale(after seconds: TimeInterval) {
+        guard Date().timeIntervalSince(lastRefresh ?? .distantPast) > seconds else { return }
+        Task { await refresh() }
     }
 
     func refresh() async {
@@ -193,7 +246,15 @@ final class Store: ObservableObject {
             var sources: [String: Set<Source>] = [:]
             var refs: [String: PRRef] = [:]
 
-            for (ref, source) in try await api.myPRRefs(login: login) {
+            // PRs we already know about don't need to wait for the search: load
+            // them while it runs, then fetch only the ones the search adds.
+            let rules = reviewRules
+            let known = Set(previous.values.filter { !$0.isMerged && !$0.isClosed }
+                                .map { PRRef(owner: $0.owner, repo: $0.repo, number: $0.number) })
+                .union(watched)
+            async let knownDetails = api.details(Array(known), viewer: login, teams: teams, rules: rules)
+            let found = try await api.myPRRefs(login: login, teams: teams)
+            for (ref, source) in found {
                 if source == .authored && !includeAuthored { continue }
                 refs[ref.id] = ref
                 sources[ref.id, default: []].insert(source)
@@ -206,22 +267,45 @@ final class Store: ObservableObject {
             // PRs that dropped out of the open-PR searches since last poll: most
             // were just merged or closed. Keep them around for the retention window.
             var lingering: [PullRequest] = []
+            var recheck: [PRRef] = []
             for old in previous.values where refs[old.id] == nil {
-                let ref = PRRef(owner: old.owner, repo: old.repo, number: old.number)
                 if old.isMerged || old.isClosed {
                     if isWithinRetention(old) { lingering.append(old) }
-                    continue
+                } else {
+                    recheck.append(PRRef(owner: old.owner, repo: old.repo, number: old.number))
                 }
-                guard var pr = try? await api.detail(ref, viewer: login, teams: teams, rules: reviewRules),
-                      pr.isMerged || pr.isClosed else { continue }
+            }
+
+            // One batched GraphQL query per ~10 PRs instead of ~7 REST calls
+            // per PR — this is what made a refresh slow.
+            let prior = previous
+            var fetched = await knownDetails
+            let missing = (Array(refs.values) + recheck).filter { !known.contains($0) }
+            if !missing.isEmpty {
+                fetched.merge(await api.details(missing, viewer: login, teams: teams, rules: rules)) { $1 }
+            }
+            for (id, pr) in fetched {
+                // "Behind" comes from a separate compare that finishes after the
+                // list is shown; keep the last answer for the same commit meanwhile.
+                if let old = prior[id], old.headSha == pr.headSha, !pr.isBehind {
+                    fetched[id]?.isBehind = old.isBehind
+                }
+            }
+
+            for ref in recheck {
+                guard var pr = fetched[ref.id], pr.isMerged || pr.isClosed,
+                      let old = prior[ref.id] else { continue }
                 pr.sources = old.sources
                 if isWithinRetention(pr) { lingering.append(pr) }
             }
 
             var fresh: [PullRequest] = []
             for ref in refs.values {
-                var pr = try await api.detail(ref, viewer: login, teams: teams, rules: reviewRules)
+                // A PR that failed to load this time keeps its last known state.
+                guard var pr = fetched[ref.id] ?? prior[ref.id] else { continue }
                 pr.sources = sources[ref.id] ?? []
+                // Don't let a still-computing mergeable state hide known conflicts.
+                if pr.mergeableUnknown, let old = prior[pr.id] { pr.hasConflicts = old.hasConflicts }
                 // A pasted link stays forever, but once it's done it ages out too.
                 if (pr.isMerged || pr.isClosed) && !isWithinRetention(pr) { continue }
                 fresh.append(pr)
@@ -248,8 +332,19 @@ final class Store: ObservableObject {
             prs = fresh
             lastRefresh = Date()
             errorText = nil
+            Task { await updateBehind() }
         } catch {
             errorText = error.localizedDescription
+        }
+    }
+
+    /// Fills in "behind base" after the list is on screen.
+    private func updateBehind() async {
+        let counts = await api.behindCounts(prs)
+        for i in prs.indices {
+            guard let n = counts[prs[i].id] else { continue }
+            prs[i].isBehind = n > 0
+            previous[prs[i].id]?.isBehind = n > 0
         }
     }
 

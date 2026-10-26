@@ -24,24 +24,39 @@ actor GitHub {
 
     func setToken(_ t: String?) {
         token = (t?.isEmpty == false) ? t : nil
+        etags = [:]
     }
+
+    /// Last response per URL, replayed when GitHub answers 304 Not Modified.
+    /// Conditional requests are what GitHub Desktop does: unchanged resources
+    /// come back fast and don't count against the rate limit.
+    private var etags: [URL: (etag: String, data: Data)] = [:]
 
     private func get(_ path: String) async throws -> Data {
         guard let token else { throw GitHubError.noToken }
         let url = path.hasPrefix("http") ? URL(string: path)!
                                          : URL(string: "https://api.github.com" + path)!
         var req = URLRequest(url: url)
+        // Our own ETag cache decides freshness; URLCache would serve stale bodies.
+        req.cachePolicy = .reloadIgnoringLocalCacheData
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
         req.setValue("GitWall", forHTTPHeaderField: "User-Agent")
+        if let cached = etags[url] { req.setValue(cached.etag, forHTTPHeaderField: "If-None-Match") }
         let (data, resp) = try await session.data(for: req)
-        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        let http = resp as? HTTPURLResponse
+        let code = http?.statusCode ?? 0
+        if code == 304, let cached = etags[url] { return cached.data }
         guard (200..<300).contains(code) else {
             throw GitHubError.http(code, String(data: data, encoding: .utf8) ?? "")
         }
+        if let etag = http?.value(forHTTPHeaderField: "ETag") { etags[url] = (etag, data) }
         return data
     }
+
+    /// Forget cached bodies, e.g. after signing in as someone else.
+    func clearCache() { etags = [:] }
 
     /// GraphQL call; returns the `data` object, throws on transport or GraphQL errors.
     /// Merges the base branch into the PR branch, like GitHub's "Update branch".
@@ -207,11 +222,6 @@ actor GitHub {
         let author: User?
     }
 
-    private struct CombinedStatus: Decodable { let state: String; let total_count: Int }
-    private struct CheckRuns: Decodable {
-        struct Run: Decodable { let status: String; let conclusion: String? }
-        let check_runs: [Run]
-    }
 
     // MARK: - API
 
@@ -238,8 +248,8 @@ actor GitHub {
 
     /// PRs GitHub considers mine: assigned, review-requested (directly or via a
     /// team), authored, or already reviewed by me and still open.
-    func myPRRefs(login: String) async throws -> [(PRRef, Source)] {
-        let queries: [(String, Source)] = [
+    func myPRRefs(login: String, teams: Set<String> = []) async throws -> [(PRRef, Source)] {
+        var queries: [(String, Source)] = [
             ("is:open is:pr assignee:\(login)", .assigned),
             ("is:open is:pr review-requested:\(login)", .reviewRequest),
             ("is:open is:pr author:\(login)", .authored),
@@ -247,18 +257,35 @@ actor GitHub {
             // this keeps it on the list until it merges.
             ("is:open is:pr reviewed-by:\(login) -author:\(login)", .reviewed),
         ]
-        var out: [(PRRef, Source)] = []
-        for (q, source) in queries {
-            let esc = q.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? q
-            let data = try await get("/search/issues?per_page=50&q=\(esc)")
-            for item in try decode(SearchResult.self, data).items {
-                // repository_url looks like https://api.github.com/repos/owner/repo
-                let parts = item.repository_url.split(separator: "/").suffix(2).map(String.init)
-                guard parts.count == 2 else { continue }
-                out.append((PRRef(owner: parts[0], repo: parts[1], number: item.number), source))
-            }
+        // Requests to a team you're on count as review requests too.
+        for team in teams.sorted() {
+            queries.append(("is:open is:pr team-review-requested:\(team) -author:\(login)", .reviewRequest))
         }
-        return out
+        // All searches at once instead of one after another.
+        return try await withThrowingTaskGroup(of: [(PRRef, Source)].self) { group in
+            for (i, (q, source)) in queries.enumerated() {
+                let optional = i >= 4   // a team search failing shouldn't sink the refresh
+                group.addTask {
+                    let esc = q.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? q
+                    guard let data = optional
+                        ? try? await self.get("/search/issues?per_page=50&q=\(esc)")
+                        : try await self.get("/search/issues?per_page=50&q=\(esc)") else { return [] }
+                    return try await self.decodeSearch(data).compactMap { item in
+                        // repository_url looks like https://api.github.com/repos/owner/repo
+                        let parts = item.repository_url.split(separator: "/").suffix(2).map(String.init)
+                        guard parts.count == 2 else { return nil }
+                        return (PRRef(owner: parts[0], repo: parts[1], number: item.number), source)
+                    }
+                }
+            }
+            var out: [(PRRef, Source)] = []
+            for try await batch in group { out += batch }
+            return out
+        }
+    }
+
+    private func decodeSearch(_ data: Data) throws -> [SearchResult.Item] {
+        try decode(SearchResult.self, data).items
     }
 
     /// PRs you worked on since `since`: your own PRs that you opened, pushed commits
@@ -315,13 +342,169 @@ actor GitHub {
         return parts.count == 2 ? (parts[0], parts[1]) : nil
     }
 
-    /// Full detail for one PR: review verdict, re-review requests, CI.
-    func detail(_ ref: PRRef, viewer: String, teams: Set<String> = [],
-                rules: [ReviewRule] = ReviewRule.defaults) async throws -> PullRequest {
-        let base = "/repos/\(ref.owner)/\(ref.repo)/pulls/\(ref.number)"
-        let pr = try decode(PRPayload.self, await get(base))
-        let reviews = try decode([Review].self, await get(base + "/reviews?per_page=100"))
+    // MARK: - Batched GraphQL
 
+    private static let prFields = """
+        number title url isDraft merged state updatedAt mergedAt closedAt
+        mergeable mergeStateStatus headRefOid baseRefName
+        author { login }
+        reviewRequests(first: 50) { nodes { requestedReviewer {
+          ... on User { login } ... on Team { slug } ... on Bot { login } ... on Mannequin { login } } } }
+        reviews(last: 100) { nodes { author { login } state submittedAt body } }
+        comments(last: 100) { nodes { author { login } body createdAt } }
+        reviewThreads(first: 100) { nodes { id isResolved path line
+          comments(first: 1) { nodes { bodyText url author { login } } } } }
+        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+        """
+
+    /// Loads many PRs in a few GraphQL round trips — one request per chunk of
+    /// PRs instead of ~7 REST calls each. PRs that fail are missing from the result.
+    func details(_ refs: [PRRef], viewer: String, teams: Set<String>,
+                 rules: [ReviewRule], chunkSize: Int = 5) async -> [String: PullRequest] {
+        let chunks = stride(from: 0, to: refs.count, by: chunkSize).map { Array(refs[$0..<min($0 + chunkSize, refs.count)]) }
+        return await withTaskGroup(of: [String: PullRequest].self) { group in
+            for chunk in chunks {
+                group.addTask { await self.detailsChunk(chunk, viewer: viewer, teams: teams, rules: rules) }
+            }
+            var out: [String: PullRequest] = [:]
+            for await part in group { out.merge(part) { $1 } }
+            return out
+        }
+    }
+
+    private func detailsChunk(_ refs: [PRRef], viewer: String, teams: Set<String>,
+                              rules: [ReviewRule]) async -> [String: PullRequest] {
+        func lit(_ s: String) -> String {
+            "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+        }
+        let parts = refs.enumerated().map { i, r in
+            "p\(i): repository(owner: \(lit(r.owner)), name: \(lit(r.repo))) { pullRequest(number: \(r.number)) { \(Self.prFields) } }"
+        }
+        let data: [String: Any]
+        do {
+            data = try await graphqlAllowingPartial("query { \(parts.joined(separator: "\n")) }")
+        } catch {
+            return [:]
+        }
+        var out: [String: PullRequest] = [:]
+        for (i, ref) in refs.enumerated() {
+            guard let repo = data["p\(i)"] as? [String: Any],
+                  let node = repo["pullRequest"] as? [String: Any] else { continue }
+            if let pr = Self.fromGraphQL(ref, node, viewer: viewer, teams: teams, rules: rules) {
+                out[ref.id] = pr
+            }
+        }
+        return out
+    }
+
+    private static let iso: ISO8601DateFormatter = ISO8601DateFormatter()
+
+    private static func fromGraphQL(_ ref: PRRef, _ n: [String: Any], viewer: String,
+                                    teams: Set<String>, rules: [ReviewRule]) -> PullRequest? {
+        func str(_ d: [String: Any]?, _ k: String) -> String? { d?[k] as? String }
+        func date(_ v: Any?) -> Date? { (v as? String).flatMap { iso.date(from: $0) } }
+        func nodes(_ k: String, in d: [String: Any]? = nil) -> [[String: Any]] {
+            ((d ?? n)[k] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
+        }
+        func login(_ d: [String: Any]) -> String? { str(d["author"] as? [String: Any], "login") }
+
+        guard let title = n["title"] as? String, let url = n["url"] as? String,
+              let updated = date(n["updatedAt"]) else { return nil }
+        let state = (n["state"] as? String ?? "OPEN").lowercased()   // open / closed / merged
+        let mergeable = n["mergeable"] as? String                   // MERGEABLE / CONFLICTING / UNKNOWN
+        let mergeState = (n["mergeStateStatus"] as? String)?.lowercased()
+
+        var users: [User] = []
+        var reqTeams: [Team] = []
+        for r in nodes("reviewRequests") {
+            guard let who = r["requestedReviewer"] as? [String: Any] else { continue }
+            if let l = who["login"] as? String { users.append(User(login: l, name: nil, avatar_url: nil)) }
+            else if let slug = who["slug"] as? String { reqTeams.append(Team(slug: slug)) }
+        }
+
+        let payload = PRPayload(
+            number: ref.number, title: title, html_url: url,
+            draft: n["isDraft"] as? Bool, merged: n["merged"] as? Bool,
+            mergeable: mergeable == "MERGEABLE" ? true : mergeable == "CONFLICTING" ? false : nil,
+            mergeable_state: mergeState == "dirty" || mergeable == "CONFLICTING" ? "dirty" : mergeState,
+            merged_at: date(n["mergedAt"]), closed_at: date(n["closedAt"]),
+            state: state == "open" ? "open" : "closed", updated_at: updated,
+            user: str(n["author"] as? [String: Any], "login").map { User(login: $0, name: nil, avatar_url: nil) },
+            requested_reviewers: users, requested_teams: reqTeams,
+            head: .init(sha: n["headRefOid"] as? String ?? ""),
+            base: .init(ref: n["baseRefName"] as? String ?? ""))
+
+        let reviews = nodes("reviews").map {
+            Review(user: login($0).map { User(login: $0, name: nil, avatar_url: nil) },
+                   state: $0["state"] as? String ?? "", submitted_at: date($0["submittedAt"]),
+                   body: $0["body"] as? String)
+        }
+        let comments = nodes("comments").compactMap { c -> IssueComment? in
+            guard let at = date(c["createdAt"]) else { return nil }
+            return IssueComment(user: login(c).map { User(login: $0, name: nil, avatar_url: nil) },
+                                body: c["body"] as? String, created_at: at)
+        }
+
+        var out = assemble(ref, pr: payload, reviews: reviews, comments: comments, behindBy: nil,
+                           viewer: viewer, teams: teams, rules: rules)
+        out.unresolved = nodes("reviewThreads").compactMap { t in
+            guard (t["isResolved"] as? Bool) == false, let id = t["id"] as? String else { return nil }
+            let first = nodes("comments", in: t).first
+            return ReviewThread(id: id, author: first.flatMap(login) ?? "unknown",
+                                path: t["path"] as? String, line: t["line"] as? Int,
+                                body: first?["bodyText"] as? String ?? "", url: first?["url"] as? String ?? "")
+        }
+        let rollup = nodes("commits").first
+            .flatMap { ($0["commit"] as? [String: Any])?["statusCheckRollup"] as? [String: Any] }?["state"] as? String
+        switch rollup {
+        case "SUCCESS": out.ci = .success
+        case "FAILURE", "ERROR": out.ci = .failure
+        case "PENDING", "EXPECTED": out.ci = .pending
+        default: out.ci = .none
+        }
+        return out
+    }
+
+    /// How many base commits each open PR is missing. GraphQL can't express
+    /// this per PR, so it's a REST compare per PR — ETag-cached and parallel.
+    func behindCounts(_ prs: [PullRequest]) async -> [String: Int] {
+        await withTaskGroup(of: (String, Int?).self) { group in
+            for pr in prs where !pr.isMerged && !pr.isClosed && !pr.headSha.isEmpty && !pr.baseRef.isEmpty {
+                group.addTask {
+                    let base = pr.baseRef.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? pr.baseRef
+                    let d = try? await self.get("/repos/\(pr.owner)/\(pr.repo)/compare/\(base)...\(pr.headSha)?per_page=1")
+                    return (pr.id, d.flatMap { try? JSONDecoder().decode(Compare.self, from: $0).behind_by })
+                }
+            }
+            var out: [String: Int] = [:]
+            for await (id, n) in group { if let n { out[id] = n } }
+            return out
+        }
+    }
+
+    /// Like `graphql`, but keeps whatever data came back when some aliases
+    /// failed (e.g. one PR the token can't see).
+    private func graphqlAllowingPartial(_ query: String) async throws -> [String: Any] {
+        guard let token else { throw GitHubError.noToken }
+        var req = URLRequest(url: URL(string: "https://api.github.com/graphql")!)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("GitWall", forHTTPHeaderField: "User-Agent")
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["query": query])
+        let (data, resp) = try await session.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(code),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let d = json["data"] as? [String: Any] else {
+            throw GitHubError.http(code, String(data: data, encoding: .utf8) ?? "")
+        }
+        return d
+    }
+
+    /// Turns a PR and its reviews/comments into our model.
+    private static func assemble(_ ref: PRRef, pr: PRPayload, reviews: [Review], comments: [IssueComment]?,
+                                 behindBy: Int?, viewer: String, teams: Set<String>,
+                                 rules: [ReviewRule]) -> PullRequest {
         var out = PullRequest(owner: ref.owner, repo: ref.repo, number: ref.number)
         out.title = pr.title
         out.author = pr.user?.login ?? ""
@@ -331,18 +514,16 @@ actor GitHub {
         out.isClosed = pr.state == "closed" && !(pr.merged ?? false)
         out.updatedAt = pr.updated_at
         out.finishedAt = pr.merged_at ?? pr.closed_at
-        // mergeable is null while GitHub is still computing it; treat as clean.
+        // mergeable is null while GitHub is still computing it (e.g. right after
+        // the base moves); the store keeps the last known answer in that case.
+        out.mergeableUnknown = pr.mergeable == nil && pr.mergeable_state != "dirty"
         out.hasConflicts = pr.mergeable == false || pr.mergeable_state == "dirty"
         // mergeable_state only says "behind" in some repos, so ask GitHub how
         // many base commits the head is missing.
         out.isBehind = pr.mergeable_state == "behind"
-        if !out.isMerged && !out.isClosed,
-           let base = pr.base.ref.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
-           let d = try? await get("/repos/\(ref.owner)/\(ref.repo)/compare/\(base)...\(pr.head.sha)?per_page=1"),
-           let cmp = try? decode(Compare.self, d) {
-            out.isBehind = cmp.behind_by > 0
-        }
+        if let behindBy { out.isBehind = behindBy > 0 }
         out.headSha = pr.head.sha
+        out.baseRef = pr.base.ref
 
         // Latest meaningful review per reviewer. COMMENTED never overrides an
         // earlier APPROVED / CHANGES_REQUESTED — that's GitHub's own rule.
@@ -398,9 +579,7 @@ actor GitHub {
             guard let l = $0.user?.login, let b = $0.body, !b.isEmpty else { return nil }
             return (l, b, $0.submitted_at ?? .distantPast, true)
         }
-        if rules.contains(where: { $0.enabled && $0.whereFrom != .reviews }),
-           let d = try? await get("/repos/\(ref.owner)/\(ref.repo)/issues/\(ref.number)/comments?per_page=100"),
-           let comments = try? decode([IssueComment].self, d) {
+        if let comments {
             posts += comments.compactMap {
                 guard let l = $0.user?.login, let b = $0.body else { return nil }
                 return (l, b, $0.created_at, false)
@@ -420,29 +599,6 @@ actor GitHub {
         }
         out.botFindings = findings.values.map(\.0).sorted { $0.login < $1.login }
 
-        out.unresolved = (try? await unresolvedThreads(ref)) ?? []
-        out.ci = (try? await ciStatus(ref, sha: pr.head.sha)) ?? .none
         return out
-    }
-
-    private func ciStatus(_ ref: PRRef, sha: String) async throws -> CIStatus {
-        let base = "/repos/\(ref.owner)/\(ref.repo)/commits/\(sha)"
-        var states: [String] = []
-        // An empty combined status reports "pending" with zero contexts — ignore it.
-        if let d = try? await get(base + "/status"),
-           let combined = try? decode(CombinedStatus.self, d), combined.total_count > 0 {
-            states.append(combined.state)
-        }
-        if let d = try? await get(base + "/check-runs?per_page=100"),
-           let runs = try? decode(CheckRuns.self, d) {
-            for r in runs.check_runs {
-                states.append(r.status == "completed" ? (r.conclusion ?? "pending") : "pending")
-            }
-        }
-        let bad: Set<String> = ["failure", "timed_out", "cancelled", "action_required", "startup_failure"]
-        if states.contains(where: { bad.contains($0) }) { return .failure }
-        if states.contains("pending") || states.contains("queued") || states.contains("in_progress") { return .pending }
-        if states.contains(where: { $0 == "success" || $0 == "neutral" || $0 == "skipped" }) { return .success }
-        return .none
     }
 }

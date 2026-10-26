@@ -93,10 +93,14 @@ struct PullRequest: Codable, Identifiable, Hashable {
     var finishedAt: Date?
     /// GitHub reports merge conflicts with the base branch.
     var hasConflicts: Bool = false
+    /// GitHub hasn't finished computing mergeability yet.
+    var mergeableUnknown: Bool = false
     /// The branch is missing commits from its base ("Update branch" on GitHub).
     var isBehind: Bool = false
     /// Head commit; a new value means new commits (e.g. after updating the branch).
     var headSha: String = ""
+    /// Base branch name, for the "behind" compare.
+    var baseRef: String = ""
 
     var verdict: ReviewVerdict = .none
     var ci: CIStatus = .none
